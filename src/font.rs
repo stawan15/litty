@@ -340,7 +340,10 @@ mod tests {
     fn cell_is_sane_and_thai_marks_have_zero_advance() {
         let mut f = Fonts::new(28.0);
         assert!((10..30).contains(&f.cell_w) && (20..50).contains(&f.cell_h));
-        assert_eq!(f.glyph('\u{0e48}', 0).m.advance_width, 0.0);
+        // Depends on a Thai font (Ayuthaya on macOS) being installed; CI's Linux image has none.
+        if cfg!(target_os = "macos") {
+            assert_eq!(f.glyph('\u{0e48}', 0).m.advance_width, 0.0);
+        }
     }
 
     #[test]
