@@ -1457,6 +1457,12 @@ impl ApplicationHandler<Ev> for App {
 }
 
 fn main() {
+    // Launched from Finder or the Dock the working directory is "/": start in the home directory.
+    if std::env::current_dir().is_ok_and(|d| d == std::path::Path::new("/")) {
+        if let Some(home) = std::env::var_os("HOME") {
+            let _ = std::env::set_current_dir(home);
+        }
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let initial_command = match args.first().map(String::as_str) {
         Some("-e") => args[1..].to_vec(),

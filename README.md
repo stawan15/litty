@@ -1,5 +1,13 @@
 # lite-term
 
+## Install (macOS, Apple Silicon)
+
+Download `lite-term-<version>-macos-arm64.dmg` from Releases, open it and drag lite-term to Applications.
+The app is not notarized, so the first launch is blocked: right-click the app and choose Open, or run
+`xattr -dr com.apple.quarantine /Applications/lite-term.app`.
+
+Build it yourself with `packaging/build-app.sh` (needs Rust and the Xcode command line tools).
+
 A small, fast terminal for macOS and Linux. Zero config: no settings file.
 
     cargo run --release            # login shell
