@@ -1,0 +1,25 @@
+# Maintainer: stawan15
+pkgname=litty-bin
+_name=litty
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Tiny, fast, zero-config terminal emulator (prebuilt binary)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/stawan15/litty"
+license=('MIT')
+depends=('libxkbcommon' 'libgl')
+optdepends=('wayland: Wayland support' 'libx11: X11 support')
+provides=('litty')
+conflicts=('litty')
+source_x86_64=("$_name-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/$_name-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("$_name-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/$_name-$pkgver-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('@LINUX_X86_64_SHA@')
+sha256sums_aarch64=('@LINUX_AARCH64_SHA@')
+
+package() {
+  cd "$srcdir/$_name-$pkgver-$CARCH-unknown-linux-gnu"
+  install -Dm755 litty "$pkgdir/usr/bin/litty"
+  install -Dm644 litty.desktop "$pkgdir/usr/share/applications/litty.desktop"
+  install -Dm644 litty.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/litty.png"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

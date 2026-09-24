@@ -1,5 +1,5 @@
 name: Release
-# Push a tag such as v0.2.0 (matching the version in Cargo.toml) to build and publish the macOS app.
+# Push a tag such as v0.2.0 (matching the version in Cargo.toml) to build every artifact and publish it.
 on:
   push:
     tags: ["v*"]
@@ -17,9 +17,76 @@ jobs:
         run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
       - run: cargo test --release
       - run: packaging/build-app.sh
-      - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dist/*.dmg
+            dist/*.tar.gz
+
+  linux:
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: cargo install --locked cargo-deb cargo-generate-rpm
+      - name: Packages
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "lite-term ${GITHUB_REF_NAME#v}" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" dist/*.dmg --clobber
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir out
+          d=litty-$VERSION-${{ matrix.target }}
+          mkdir $d
+          cp target/release/litty README.md LICENSE packaging/litty.desktop packaging/litty.png $d/
+          tar -czf out/$d.tar.gz $d
+          cargo deb --no-build --output out/
+          cargo generate-rpm --output out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: out/*
+
+  publish:
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums and manifests
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          (cd artifacts && sha256sum * > SHA256SUMS)
+          packaging/render.sh "$VERSION" artifacts/SHA256SUMS manifests
+          cp manifests/PKGBUILD artifacts/PKGBUILD
+      - name: GitHub release
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "litty ${GITHUB_REF_NAME#v}" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
+      - name: Homebrew tap
+        if: env.TAP_TOKEN != ''
+        run: |
+          git clone "https://x-access-token:$TAP_TOKEN@github.com/${{ github.repository_owner }}/homebrew-tap" tap
+          mkdir -p tap/Casks tap/Formula
+          cp manifests/cask.rb tap/Casks/litty.rb
+          cp manifests/formula.rb tap/Formula/litty.rb
+          cd tap
+          git config user.name "litty release bot"
+          git config user.email "actions@github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "litty ${GITHUB_REF_NAME#v}"
+          git push
+      - name: crates.io
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish

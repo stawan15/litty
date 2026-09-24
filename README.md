@@ -1,12 +1,23 @@
-# lite-term
+# litty
 
-## Install (macOS, Apple Silicon)
+## Install
 
-Download `lite-term-<version>-macos-arm64.dmg` from Releases, open it and drag lite-term to Applications.
-The app is not notarized, so the first launch is blocked: right-click the app and choose Open, or run
-`xattr -dr com.apple.quarantine /Applications/lite-term.app`.
+| Platform | Command |
+|---|---|
+| macOS (Homebrew) | `brew install --cask stawan15/tap/litty` |
+| Linux (Homebrew) | `brew install stawan15/tap/litty` |
+| Any (Rust) | `cargo install litty-term` or `cargo binstall litty-term` |
+| Nix | `nix run github:stawan15/litty` |
+| Arch (AUR) | `yay -S litty-bin` |
+| Debian / Ubuntu | `sudo apt install ./litty_<version>_amd64.deb` (from Releases) |
+| Fedora / RHEL | `sudo dnf install ./litty-<version>-1.x86_64.rpm` (from Releases) |
+| macOS / Linux script | `curl -fsSL https://raw.githubusercontent.com/stawan15/litty/master/install.sh \| sh` |
+| macOS by hand | open the `.dmg` from Releases and drag litty to Applications |
 
-Build it yourself with `packaging/build-app.sh` (needs Rust and the Xcode command line tools).
+The macOS app is not notarized. Homebrew and the script clear the download quarantine for you; after a
+manual download, right-click the app and choose Open, or run `xattr -dr com.apple.quarantine /Applications/litty.app`.
+
+Build it yourself with `cargo build --release` (Linux) or `packaging/build-app.sh` (macOS app + dmg).
 
 A small, fast terminal for macOS and Linux. Zero config: no settings file.
 
@@ -59,4 +70,4 @@ A small, fast terminal for macOS and Linux. Zero config: no settings file.
 
 Mouse-aware programs (vim, tmux, htop) receive the mouse; hold Shift to select text instead.
 
-Debugging: `LITE_TERM_LOG=/tmp/lt.log lite-term` records every byte read from the shell, every key sent and every resize with timestamps, so a display glitch can be replayed exactly.
+Debugging: `LITTY_LOG=/tmp/lt.log litty` records every byte read from the shell, every key sent and every resize with timestamps, so a display glitch can be replayed exactly.

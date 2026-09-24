@@ -29,12 +29,12 @@ use winit::window::{CursorIcon, UserAttentionType, Window, WindowId};
 
 nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, Winsize);
 
-/// Debug aid: with `LITE_TERM_LOG=file`, every PTY read, key/paste sent and resize is appended
+/// Debug aid: with `LITTY_LOG=file`, every PTY read, key/paste sent and resize is appended
 /// with a timestamp, so display bugs can be replayed exactly.
 fn debug_log(tag: &str, bytes: &[u8]) {
     static LOG: OnceLock<Option<(Mutex<File>, Instant)>> = OnceLock::new();
     let log = LOG.get_or_init(|| {
-        let path = std::env::var_os("LITE_TERM_LOG")?;
+        let path = std::env::var_os("LITTY_LOG")?;
         Some((Mutex::new(File::create(path).ok()?), Instant::now()))
     });
     if let Some((file, t0)) = log {
@@ -242,7 +242,7 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Makes zsh report prompt and command boundaries (OSC 133) so the terminal can draw command
 /// blocks. The temporary ZDOTDIR only holds a .zshenv that restores the user's own ZDOTDIR and
 /// sources their .zshenv before adding the hooks.
-const ZSH_INTEGRATION: &str = r#"# lite-term shell integration (OSC 133 prompt marks).
+const ZSH_INTEGRATION: &str = r#"# litty shell integration (OSC 133 prompt marks).
 if [[ -n "$LT_ORIG_ZDOTDIR" ]]; then ZDOTDIR="$LT_ORIG_ZDOTDIR"; else unset ZDOTDIR; fi
 unset LT_ORIG_ZDOTDIR
 [[ -f "${ZDOTDIR:-$HOME}/.zshenv" ]] && source "${ZDOTDIR:-$HOME}/.zshenv"
@@ -259,7 +259,7 @@ fn install_zsh_integration() -> Option<PathBuf> {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    let dir = cache.join("lite-term/zsh");
+    let dir = cache.join("litty/zsh");
     std::fs::create_dir_all(&dir).ok()?;
     std::fs::write(dir.join(".zshenv"), ZSH_INTEGRATION).ok()?;
     Some(dir)
@@ -275,7 +275,7 @@ fn resolve_program(name: &str) -> Option<CString> {
     CString::new(path.to_str()?).ok()
 }
 
-/// Start `command` (`lite-term -e cmd args...`), or a login shell if empty, on a new PTY, in
+/// Start `command` (`litty -e cmd args...`), or a login shell if empty, on a new PTY, in
 /// `cwd` if given. Returns the PTY master and the child's pid.
 ///
 /// Everything the child needs is built before forking: other threads exist by now, so the child
@@ -470,7 +470,7 @@ fn state_file() -> Option<PathBuf> {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(cache.join("lite-term/window"))
+    Some(cache.join("litty/window"))
 }
 
 /// (logical width, logical height, font size in points) saved by the previous run.
@@ -639,7 +639,7 @@ impl App {
         let (cols, rows) = self.renderer.as_ref().map_or((80, 24), |r| r.grid_size(r.area()));
         let size = Winsize { ws_row: rows as u16, ws_col: cols as u16, ws_xpixel: 0, ws_ypixel: 0 };
         let Some((master, pid)) = spawn_shell(&size, command, cwd) else {
-            eprintln!("lite-term: failed to start a shell");
+            eprintln!("litty: failed to start a shell");
             return None;
         };
         let term = Arc::new(Mutex::new(Term { grid: Grid::new(cols, rows), parser: Parser::new() }));
@@ -704,7 +704,7 @@ impl App {
         tab.active = id;
         let title = self.term().lock().unwrap().grid.win_title.clone();
         if let Some(w) = &self.window {
-            w.set_title(if title.is_empty() { "lite-term" } else { &title });
+            w.set_title(if title.is_empty() { "litty" } else { &title });
         }
         self.redraw_soon();
     }
@@ -722,7 +722,7 @@ impl App {
         }
         let title = self.term().lock().unwrap().grid.win_title.clone();
         if let Some(w) = &self.window {
-            w.set_title(if title.is_empty() { "lite-term" } else { &title });
+            w.set_title(if title.is_empty() { "litty" } else { &title });
         }
         self.redraw_soon();
     }
@@ -1363,7 +1363,7 @@ impl ApplicationHandler<Ev> for App {
             }
             None => (900.0, 560.0),
         };
-        let attrs = Window::default_attributes().with_title("lite-term").with_inner_size(LogicalSize::new(w, h));
+        let attrs = Window::default_attributes().with_title("litty").with_inner_size(LogicalSize::new(w, h));
         let window = Arc::new(el.create_window(attrs).unwrap());
         window.set_ime_allowed(true);
         self.presenter = Some(Presenter::new(&window));

@@ -1,7 +1,44 @@
 [package]
-name = "lite-term"
-version = "0.1.1"
+name = "litty-term"
+version = "0.2.0"
 edition = "2024"
+description = "litty: a tiny, fast, zero-config terminal emulator for macOS and Linux"
+license = "MIT"
+repository = "https://github.com/stawan15/litty"
+readme = "README.md"
+keywords = ["terminal", "terminal-emulator", "tty", "pty"]
+categories = ["command-line-utilities"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+
+[[bin]]
+name = "litty"
+path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/litty-{ version }-{ target }.tar.gz"
+bin-dir = "litty-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.deb]
+name = "litty"
+maintainer = "stawan15"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/litty", "usr/bin/", "755"],
+    ["packaging/litty.desktop", "usr/share/applications/", "644"],
+    ["packaging/litty.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["README.md", "usr/share/doc/litty/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "litty"
+assets = [
+    { source = "target/release/litty", dest = "/usr/bin/litty", mode = "755" },
+    { source = "packaging/litty.desktop", dest = "/usr/share/applications/litty.desktop", mode = "644" },
+    { source = "packaging/litty.png", dest = "/usr/share/icons/hicolor/512x512/apps/litty.png", mode = "644" },
+]
 
 [dependencies]
 ab_glyph = "0.2.32"

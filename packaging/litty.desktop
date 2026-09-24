@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=litty
+Comment=A tiny, fast terminal emulator
+Exec=litty
+Icon=litty
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;
+StartupWMClass=litty
