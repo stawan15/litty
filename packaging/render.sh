@@ -1,7 +1,7 @@
 #!/bin/sh
 # Fills the package-manager templates from a release's SHA256SUMS: render.sh VERSION SHA256SUMS OUTDIR
 set -e
-VERSION=$1 SUMS=$2 OUT=$3
+VERSION=$1 SUMS=$(realpath "$2") OUT=$(realpath -m "$3" 2>/dev/null || { mkdir -p "$3" && cd "$3" && pwd; })
 cd "$(dirname "$0")/templates"
 sha() { awk -v f="$1" '$2 == f { print $1 }' "$SUMS"; }
 DMG=$(sha "litty-$VERSION-macos-universal.dmg")
