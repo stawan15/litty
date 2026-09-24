@@ -1,0 +1,29 @@
+[package]
+name = "lite-term"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ab_glyph = "0.2.32"
+nix = { version = "0.31.3", features = ["term", "process", "ioctl"] }
+rustybuzz = "0.20.1"
+unicode-width = "0.2.2"
+vte = "0.15.0"
+winit = "0.30.13"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = "0.3"
+objc2-foundation = "0.3"
+objc2-io-surface = "0.3"
+objc2-quartz-core = "0.3"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+softbuffer = "0.4.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
