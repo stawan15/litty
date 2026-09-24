@@ -23,6 +23,7 @@ pkg-fmt = "tgz"
 name = "litty"
 maintainer = "stawan15"
 section = "utils"
+extended-description = "Zero config: tabs and splits, scrollback with reflow, ligatures, command blocks and Thai support."
 priority = "optional"
 depends = "$auto"
 assets = [
