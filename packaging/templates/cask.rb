@@ -7,8 +7,6 @@ cask "litty" do
   desc "Tiny, fast, zero-config terminal emulator"
   homepage "https://github.com/stawan15/litty"
 
-  depends_on macos: :big_sur
-
   app "litty.app"
   binary "#{appdir}/litty.app/Contents/MacOS/litty"
 
