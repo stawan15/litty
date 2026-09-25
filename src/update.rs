@@ -17,6 +17,8 @@ pub enum Event {
     Found(String),
     /// The new version was downloaded, verified and unpacked, ready to be swapped in on quit.
     Staged(String, PathBuf),
+    /// An explicit check found nothing newer.
+    Current,
     Failed(String),
 }
 
@@ -94,20 +96,24 @@ fn fetch_latest() -> Option<String> {
     parse_version(&tag).map(|_| tag)
 }
 
-/// Report a newer release, asking the network at most once an hour.
-pub fn check(report: impl FnOnce(Event)) {
+/// Report a newer release, asking the network at most once an hour. `force` (the user asked) always
+/// asks, also offers a skipped version, and reports when litty is current or GitHub can't be reached.
+pub fn check(force: bool, report: impl FnOnce(Event)) {
     let (ts, mut latest, skipped) = read_state();
-    if now().saturating_sub(ts) >= CHECK_EVERY {
+    if force || now().saturating_sub(ts) >= CHECK_EVERY {
         match fetch_latest() {
             Some(tag) => {
                 latest = tag;
                 write_state(now(), &latest, &skipped);
             }
+            None if force => return report(Event::Failed("can't reach GitHub".into())),
             None => return,
         }
     }
-    if is_newer(&latest, VERSION) && latest != skipped {
+    if is_newer(&latest, VERSION) && (force || latest != skipped) {
         report(Event::Found(latest));
+    } else if force {
+        report(Event::Current);
     }
 }
 

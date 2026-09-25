@@ -532,6 +532,11 @@ impl Grid {
         Some(out)
     }
 
+    /// When the command that is still running (OSC 133 C without D yet) started.
+    pub fn running_since(&self) -> Option<Instant> {
+        self.marks.back().filter(|m| m.end.is_none()).and_then(|m| m.started)
+    }
+
     /// Handle OSC 133 semantic prompt marks: A = prompt start, C = command start, D = finished.
     fn semantic_prompt(&mut self, kind: &[u8], rest: &[&[u8]]) {
         let line = self.pushed + self.cy as u64;

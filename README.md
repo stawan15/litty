@@ -39,6 +39,7 @@ litty needs no configuration. To change a default, create `~/.config/litty/confi
     font-size = 14        # points; overrides the zoom remembered from the last session
     cursor = block        # block | bar | underline
     cursor-blink = false
+    tray = true           # macOS menu-bar hamster; false removes it
 
 Changes apply the next time litty starts.
 
@@ -59,6 +60,11 @@ window. Press Cmd+Shift+U (Ctrl+Shift+U on Linux) to open it: Enter downloads th
 background and installs it when you quit, Esc skips that version. Downloads are verified with an
 ed25519 signature before anything is replaced. If a package manager installed litty (Homebrew, apt,
 Nix, cargo), the notice shows the command to run instead and Enter copies it.
+
+On macOS a small hamster sits in the menu bar. It runs in its wheel while a command is running in
+any tab (zsh, or any shell that emits OSC 133), and stuffs its cheeks while an update downloads; a
+blue dot means an update is ready. Its menu can check for updates, install one, open a window or
+quit. When nothing is happening it stays still and costs no CPU.
 
 ## What makes it different
 

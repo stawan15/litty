@@ -5,6 +5,7 @@
 //!   font-size = 14                 (points)
 //!   cursor = block | bar | underline
 //!   cursor-blink = true | false
+//!   tray = true | false            (macOS menu-bar hamster)
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -17,9 +18,10 @@ pub struct Config {
     /// 0 block, 1 underline, 2 bar.
     pub cursor: u8,
     pub cursor_blink: bool,
+    pub tray: bool,
 }
 
-const DEFAULT: Config = Config { light: false, font_size: None, cursor: 0, cursor_blink: false };
+const DEFAULT: Config = Config { light: false, font_size: None, cursor: 0, cursor_blink: false, tray: true };
 
 fn path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
@@ -54,6 +56,7 @@ pub fn parse(text: &str) -> Config {
                 _ => 0,
             },
             "cursor-blink" => c.cursor_blink = value == "true",
+            "tray" => c.tray = value != "false",
             _ => {}
         }
     }
@@ -71,8 +74,8 @@ mod tests {
 
     #[test]
     fn parses_known_keys_and_ignores_the_rest() {
-        let c = parse("# comment\ntheme = light\nfont-size = 16 # points\ncursor = \"bar\"\ncursor-blink = true\nunknown = 1\nnonsense\n");
-        assert!(c.light && c.font_size == Some(16.0) && c.cursor == 2 && c.cursor_blink);
+        let c = parse("# comment\ntheme = light\nfont-size = 16 # points\ncursor = \"bar\"\ncursor-blink = true\ntray = false\nunknown = 1\nnonsense\n");
+        assert!(c.light && c.font_size == Some(16.0) && c.cursor == 2 && c.cursor_blink && !c.tray);
         let c = parse("font-size = 400\ntheme = dark");
         assert!(!c.light && c.font_size == Some(48.0));
     }

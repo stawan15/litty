@@ -65,6 +65,9 @@ enum Ev {
     Exit(usize),
     /// Progress of the self-updater.
     Update(update::Event),
+    /// A pick in the menu-bar menu.
+    #[cfg(target_os = "macos")]
+    Tray(macos::TrayAction),
 }
 
 struct Pane {
@@ -215,8 +218,36 @@ struct UpdateUi {
     open: bool,
     /// The package-manager command for updating, when litty may not replace itself.
     managed: Option<String>,
+    /// A check the user asked for (from the tray) is running.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    checking: bool,
+    /// The last check the user asked for found nothing newer.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    current: bool,
     /// Bumped on every change so each window knows to repaint.
     generation: u64,
+}
+
+/// Act on an available update: copy the package manager's command, or download and stage the
+/// release in the background (it is swapped in when litty quits).
+fn install_update(ui: &RefCell<UpdateUi>, proxy: &EventLoopProxy<Ev>) {
+    let mut ui = ui.borrow_mut();
+    let update::State::Available(version) = ui.state.clone() else { return };
+    ui.open = false;
+    ui.generation += 1;
+    if let Some(cmd) = &ui.managed {
+        clipboard_set(cmd.as_bytes());
+        return;
+    }
+    ui.state = update::State::Downloading(version.clone());
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let ev = match update::stage(&version) {
+            Ok(path) => update::Event::Staged(version, path),
+            Err(msg) => update::Event::Failed(msg),
+        };
+        let _ = proxy.send_event(Ev::Update(ev));
+    });
 }
 
 /// A request a window makes of the app, which owns window creation.
@@ -1110,22 +1141,8 @@ impl Win {
                 self.set_update(|ui| (ui.state, ui.open) = (update::State::None, false));
             }
             Key::Named(NamedKey::Enter) => {
-                let managed = self.ui.borrow().managed.clone();
-                if let Some(cmd) = managed {
-                    clipboard_set(cmd.as_bytes());
-                    self.set_update(|ui| ui.open = false);
-                } else {
-                    let v = version.clone();
-                    self.set_update(|ui| (ui.state, ui.open) = (update::State::Downloading(v), false));
-                    let proxy = self.proxy.clone();
-                    std::thread::spawn(move || {
-                        let ev = match update::stage(&version) {
-                            Ok(path) => update::Event::Staged(version, path),
-                            Err(msg) => update::Event::Failed(msg),
-                        };
-                        let _ = proxy.send_event(Ev::Update(ev));
-                    });
-                }
+                install_update(&self.ui, &self.proxy);
+                self.notice_changed();
             }
             _ => {
                 self.set_update(|ui| ui.open = false);
@@ -1667,6 +1684,17 @@ struct App {
     initial_command: Vec<String>,
     ui: Rc<RefCell<UpdateUi>>,
     last_focus: Option<WindowId>,
+    #[cfg(target_os = "macos")]
+    tray: Option<macos::Tray>,
+    /// The tray is wanted but not made yet; it is made shortly after the first frame, because
+    /// AppKit takes ~12 ms to set up a status item and startup should not wait for it.
+    #[cfg(target_os = "macos")]
+    tray_wanted: bool,
+    #[cfg(target_os = "macos")]
+    tray_at: Option<Instant>,
+    /// Update generation the tray menu shows.
+    #[cfg(target_os = "macos")]
+    tray_generation: Option<u64>,
 }
 
 impl App {
@@ -1703,6 +1731,64 @@ impl App {
         }
     }
 
+    /// Check for updates now, because the user asked.
+    #[cfg(target_os = "macos")]
+    fn check_update(&mut self) {
+        {
+            let mut ui = self.ui.borrow_mut();
+            (ui.checking, ui.current) = (true, false);
+            ui.generation += 1;
+        }
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || update::check(true, |e| drop(proxy.send_event(Ev::Update(e)))));
+    }
+
+    /// Keep the menu-bar hamster in step: its pose, and the update status in its menu. Returns when
+    /// the next animation frame is due.
+    #[cfg(target_os = "macos")]
+    fn sync_tray(&mut self, now: Instant) -> Option<Instant> {
+        use macos::{TrayAction, TrayMode};
+        let tray = self.tray.as_mut()?;
+        let ui = self.ui.borrow();
+        let panes = self.wins.values().flat_map(|w| w.tabs.iter().flat_map(|t| &t.panes));
+        let since = panes.filter_map(|p| p.term.lock().unwrap().grid.running_since()).min();
+        // Quick commands (ls, cd) don't make the hamster twitch.
+        let running = since.map(|t| t + Duration::from_secs(1));
+        let mode = match &ui.state {
+            _ if ui.checking => TrayMode::Loading,
+            update::State::Downloading(_) => TrayMode::Loading,
+            _ if running.is_some_and(|t| t <= now) => TrayMode::Running,
+            update::State::Available(_) | update::State::Staged(..) => TrayMode::Update,
+            _ => TrayMode::Idle,
+        };
+        if self.tray_generation != Some(ui.generation) {
+            self.tray_generation = Some(ui.generation);
+            let v = update::VERSION;
+            let check = Some(("Check for Updates", TrayAction::Check));
+            let install;
+            let (status, action) = match &ui.state {
+                _ if ui.checking => ("Checking for updates…".to_string(), None),
+                update::State::None if ui.current => (format!("litty {v} is up to date"), check),
+                update::State::None => (format!("litty {v}"), check),
+                update::State::Available(new) => {
+                    install = match &ui.managed {
+                        Some(cmd) => format!("Copy “{cmd}”"),
+                        None => format!("Install {new} (applies on quit)"),
+                    };
+                    (format!("litty {new} is available"), Some((install.as_str(), TrayAction::Install)))
+                }
+                update::State::Downloading(new) => (format!("Downloading {new}…"), None),
+                update::State::Staged(new, _) => (format!("{new} installs when litty quits"), None),
+                update::State::Failed(msg) => (format!("Update failed: {msg}"), check),
+            };
+            tray.set_menu(&status, action);
+        }
+        // With a litty window in front the terminal already shows what's going on: hold still.
+        let still = mode == TrayMode::Running && self.wins.values().any(|w| w.focused);
+        let next = tray.animate(mode, still, now);
+        next.into_iter().chain(running.filter(|&t| t > now)).min()
+    }
+
     fn close_window(&mut self, id: WindowId) {
         if let Some(mut w) = self.wins.remove(&id) {
             w.shutdown();
@@ -1725,13 +1811,20 @@ impl ApplicationHandler<Ev> for App {
         self.add_window(el, &command, None, None);
         if command.is_empty() && update::enabled() {
             let proxy = self.proxy.clone();
-            std::thread::spawn(move || update::check(|e| drop(proxy.send_event(Ev::Update(e)))));
+            std::thread::spawn(move || update::check(false, |e| drop(proxy.send_event(Ev::Update(e)))));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.tray_wanted = config::get().tray;
         }
     }
 
     fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
         if let StartCause::ResumeTimeReached { .. } = cause {
-            for w in self.wins.values_mut() {
+            // Only windows whose postponed frame is due; blinks are handled in `tick`, and the tray
+            // animation must not repaint windows.
+            let now = Instant::now();
+            for w in self.wins.values_mut().filter(|w| w.frame_deadline.is_some_and(|d| d <= now)) {
                 w.frame_deadline = None;
                 w.redraw_soon();
             }
@@ -1742,6 +1835,15 @@ impl ApplicationHandler<Ev> for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let now = Instant::now();
         let deadline = self.wins.values_mut().filter_map(|w| w.tick(now)).min();
+        #[cfg(target_os = "macos")]
+        let deadline = {
+            if self.tray_at.is_some_and(|t| t <= now) {
+                self.tray_at = None;
+                let proxy = Mutex::new(self.proxy.clone());
+                self.tray = macos::Tray::new(Box::new(move |a| drop(proxy.lock().unwrap().send_event(Ev::Tray(a)))));
+            }
+            deadline.into_iter().chain(self.sync_tray(now)).chain(self.tray_at).min()
+        };
         el.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 
@@ -1766,6 +1868,8 @@ impl ApplicationHandler<Ev> for App {
             Ev::Update(e) => {
                 {
                     let mut ui = self.ui.borrow_mut();
+                    ui.checking = false;
+                    ui.current = matches!(e, update::Event::Current);
                     ui.state = match e {
                         update::Event::Found(v) => {
                             ui.managed = update::managed_by();
@@ -1773,8 +1877,24 @@ impl ApplicationHandler<Ev> for App {
                         }
                         update::Event::Staged(v, path) => update::State::Staged(v, path),
                         update::Event::Failed(msg) => update::State::Failed(msg),
+                        update::Event::Current => update::State::None,
                     };
                     ui.generation += 1;
+                }
+                self.settle(el, None);
+            }
+            #[cfg(target_os = "macos")]
+            Ev::Tray(action) => {
+                match action {
+                    macos::TrayAction::Check => self.check_update(),
+                    macos::TrayAction::Install => install_update(&self.ui, &self.proxy),
+                    macos::TrayAction::NewWindow => self.add_window(el, &[], None, None),
+                    macos::TrayAction::Quit => {
+                        let ids: Vec<WindowId> = self.wins.keys().copied().collect();
+                        for id in ids {
+                            self.close_window(id);
+                        }
+                    }
                 }
                 self.settle(el, None);
             }
@@ -1807,6 +1927,11 @@ impl ApplicationHandler<Ev> for App {
                 if matches!(event, WindowEvent::Focused(true)) {
                     self.last_focus = Some(id);
                 }
+                #[cfg(target_os = "macos")]
+                if self.tray_wanted && matches!(event, WindowEvent::RedrawRequested) {
+                    self.tray_wanted = false;
+                    self.tray_at = Some(Instant::now() + Duration::from_millis(100));
+                }
                 let Some(win) = self.wins.get_mut(&id) else { return };
                 win.on_window_event(event);
                 self.settle(el, Some(id));
@@ -1837,6 +1962,14 @@ fn main() {
         initial_command,
         ui: Rc::new(RefCell::new(UpdateUi::default())),
         last_focus: None,
+        #[cfg(target_os = "macos")]
+        tray: None,
+        #[cfg(target_os = "macos")]
+        tray_wanted: false,
+        #[cfg(target_os = "macos")]
+        tray_at: None,
+        #[cfg(target_os = "macos")]
+        tray_generation: None,
     };
     event_loop.run_app(&mut app).unwrap();
 }
