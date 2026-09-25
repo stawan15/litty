@@ -1,6 +1,8 @@
 mod boxdraw;
 mod font;
 mod grid;
+#[cfg(target_os = "macos")]
+mod macos;
 mod present;
 mod render;
 mod update;
@@ -10,13 +12,16 @@ use nix::libc;
 use nix::pty::{ForkptyResult, Winsize, forkpty};
 use present::Presenter;
 use render::{PaneView, Rect, Renderer, TabHit};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use vte::Parser;
@@ -26,6 +31,8 @@ use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, S
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+#[cfg(target_os = "macos")]
+use winit::platform::macos::{ActiveEventLoopExtMacOS, WindowAttributesExtMacOS, WindowExtMacOS};
 use winit::window::{CursorIcon, UserAttentionType, Window, WindowId};
 
 nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, Winsize);
@@ -49,12 +56,10 @@ struct Term {
 }
 
 enum Ev {
-    /// New output arrived.
-    Wake,
+    /// New output arrived in the pane with this id.
+    Wake(usize),
     /// The shell of the pane with this id exited.
     Exit(usize),
-    /// Last tab closed.
-    Quit,
     /// Progress of the self-updater.
     Update(update::Event),
 }
@@ -196,13 +201,39 @@ fn layout(node: &Node, rect: Rect, cell: (usize, usize), gap: usize, out: &mut V
     path.pop();
 }
 
-struct App {
+/// Pane ids are unique across windows so events can be routed by id.
+static NEXT_PANE: AtomicUsize = AtomicUsize::new(0);
+
+/// Update state shared by every window (each shows the same notice).
+#[derive(Default)]
+struct UpdateUi {
+    state: update::State,
+    /// The update prompt (Cmd+Shift+U) is showing instead of the short notice.
+    open: bool,
+    /// The package-manager command for updating, when litty may not replace itself.
+    managed: Option<String>,
+    /// Bumped on every change so each window knows to repaint.
+    generation: u64,
+}
+
+/// A request a window makes of the app, which owns window creation.
+enum Want {
+    /// A new native tab next to this window (macOS), opened in this directory.
+    Tab(Option<String>),
+    /// A new independent window.
+    Window(Option<String>),
+}
+
+/// One window: on macOS exactly one tab (native tabs are separate windows), elsewhere it draws its own tab bar.
+struct Win {
     tabs: Vec<Tab>,
     active: usize,
-    next_id: usize,
     proxy: EventLoopProxy<Ev>,
-    /// Command for the first pane (`-e cmd`); later panes always run a login shell.
-    initial_command: Vec<String>,
+    ui: Rc<RefCell<UpdateUi>>,
+    seen_generation: u64,
+    /// Set when the last pane closed: the app drops the window.
+    closed: bool,
+    want: Option<Want>,
     mods: ModifiersState,
     window: Option<Arc<Window>>,
     presenter: Option<Presenter>,
@@ -232,11 +263,6 @@ struct App {
     icon: CursorIcon,
     /// Find bar query while the bar is open.
     find: Option<String>,
-    update: update::State,
-    /// The update prompt (Cmd+Shift+U) is showing instead of the short notice.
-    update_open: bool,
-    /// The package-manager command for updating, when litty may not replace itself.
-    update_managed: Option<String>,
 }
 
 const DEFAULT_PT: f32 = 14.0;
@@ -353,7 +379,7 @@ fn spawn_reader(id: usize, mut pty: File, term: Arc<Mutex<Term>>, pending: Arc<A
             if !reply.is_empty() {
                 let _ = pty.write_all(&reply);
             }
-            if !pending.swap(true, Ordering::SeqCst) && proxy.send_event(Ev::Wake).is_err() {
+            if !pending.swap(true, Ordering::SeqCst) && proxy.send_event(Ev::Wake(id)).is_err() {
                 return;
             }
         }
@@ -500,7 +526,7 @@ fn load_state() -> Option<(f64, f64, f32)> {
     ((200.0..10000.0).contains(&w) && (100.0..10000.0).contains(&h) && (6.0..=48.0).contains(&pt)).then_some((w, h, pt))
 }
 
-impl App {
+impl Win {
     fn redraw_soon(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -664,8 +690,7 @@ impl App {
         };
         let term = Arc::new(Mutex::new(Term { grid: Grid::new(cols, rows), parser: Parser::new() }));
         let (pending, exited) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = NEXT_PANE.fetch_add(1, Ordering::Relaxed);
         spawn_reader(id, master.try_clone().ok()?, term.clone(), pending.clone(), exited.clone(), pid, self.proxy.clone());
         Some(Pane { id, term, master, pending, pid, exited })
     }
@@ -686,7 +711,11 @@ impl App {
 
     fn open_tab(&mut self) {
         let cwd = self.current_dir();
-        self.new_tab(&[], cwd);
+        if cfg!(target_os = "macos") {
+            self.want = Some(Want::Tab(cwd));
+        } else {
+            self.new_tab(&[], cwd);
+        }
     }
 
     /// Split the focused pane: `vertical` puts the new pane to its right, otherwise below.
@@ -790,7 +819,7 @@ impl App {
             }
         }
         if self.tabs.is_empty() {
-            let _ = self.proxy.send_event(Ev::Quit);
+            self.closed = true;
             return;
         }
         let active = if i < self.active { self.active - 1 } else { self.active.min(self.tabs.len() - 1) };
@@ -805,6 +834,11 @@ impl App {
     }
 
     fn cycle_tab(&mut self, dir: isize) {
+        #[cfg(target_os = "macos")]
+        if let Some(w) = &self.window {
+            if dir < 0 { w.select_previous_tab() } else { w.select_next_tab() }
+            return;
+        }
         let n = self.tabs.len() as isize;
         if n > 1 {
             self.activate((self.active as isize + dir).rem_euclid(n) as usize);
@@ -813,6 +847,12 @@ impl App {
 
     /// Cmd+1..8 select that tab, Cmd+9 the last one.
     fn goto_tab(&mut self, n: usize) {
+        #[cfg(target_os = "macos")]
+        if let Some(w) = &self.window {
+            let last = w.num_tabs().saturating_sub(1);
+            w.select_tab_at_index(if n >= 9 { last } else { n - 1 });
+            return;
+        }
         let i = if n >= 9 { self.tabs.len() - 1 } else { n - 1 };
         if i < self.tabs.len() {
             self.activate(i);
@@ -893,10 +933,18 @@ impl App {
         self.redraw_soon();
     }
 
-    /// Cmd+N: a new independent window (a new process).
-    fn new_window(&self) {
-        if let Ok(exe) = std::env::current_exe() {
-            let _ = Command::new(exe).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    /// Cmd+N: a new independent window.
+    fn new_window(&mut self) {
+        self.want = Some(Want::Window(self.current_dir()));
+    }
+
+    /// Hang up every shell of this window (it is being closed).
+    fn shutdown(&mut self) {
+        for pane in self.tabs.iter().flat_map(|t| &t.panes) {
+            if !pane.exited.load(Ordering::SeqCst) {
+                // SAFETY: the child has not been reaped, so the pid is still ours.
+                unsafe { libc::kill(pane.pid, libc::SIGHUP) };
+            }
         }
     }
 
@@ -960,10 +1008,14 @@ impl App {
             "k" => self.clear_screen(),
             "n" => self.new_window(),
             "u" if shift => {
-                match self.update {
-                    update::State::None => {}
-                    update::State::Failed(_) => self.update = update::State::None,
-                    _ => self.update_open = !self.update_open,
+                {
+                    let mut ui = self.ui.borrow_mut();
+                    match ui.state {
+                        update::State::None => {}
+                        update::State::Failed(_) => ui.state = update::State::None,
+                        _ => ui.open = !ui.open,
+                    }
+                    ui.generation += 1;
                 }
                 self.notice_changed();
             }
@@ -1003,10 +1055,11 @@ impl App {
     /// Text of the update notice: a short pill, or the prompt once opened.
     fn update_notice(&self) -> Option<String> {
         let key = if cfg!(target_os = "macos") { "⇧⌘U" } else { "Ctrl+Shift+U" };
-        Some(match &self.update {
+        let ui = self.ui.borrow();
+        Some(match &ui.state {
             update::State::None => return None,
-            update::State::Available(v) if !self.update_open => format!("↑ {v}  {key}"),
-            update::State::Available(v) => match &self.update_managed {
+            update::State::Available(v) if !ui.open => format!("↑ {v}  {key}"),
+            update::State::Available(v) => match &ui.managed {
                 Some(cmd) => format!("{v} · {cmd} · Enter: copy · Esc: skip"),
                 None => format!("{v} · Enter: update on quit · Esc: skip"),
             },
@@ -1018,6 +1071,7 @@ impl App {
 
     /// Repaint the active tab so the notice appears, changes or disappears.
     fn notice_changed(&mut self) {
+        self.seen_generation = self.ui.borrow().generation;
         for p in &self.tab().panes {
             p.term.lock().unwrap().grid.dirty.fill(true);
         }
@@ -1026,10 +1080,10 @@ impl App {
 
     /// Keys while the update prompt is open. Enter and Esc are consumed; any other key closes it.
     fn update_key(&mut self, e: &KeyEvent) -> bool {
-        let update::State::Available(version) = self.update.clone() else {
+        let state = self.ui.borrow().state.clone();
+        let update::State::Available(version) = state else {
             if matches!(e.logical_key, Key::Named(NamedKey::Escape)) {
-                self.update_open = false;
-                self.notice_changed();
+                self.set_update(|ui| ui.open = false);
                 return true;
             }
             return false;
@@ -1037,13 +1091,16 @@ impl App {
         match &e.logical_key {
             Key::Named(NamedKey::Escape) => {
                 update::skip(&version);
-                self.update = update::State::None;
+                self.set_update(|ui| (ui.state, ui.open) = (update::State::None, false));
             }
             Key::Named(NamedKey::Enter) => {
-                if let Some(cmd) = &self.update_managed {
+                let managed = self.ui.borrow().managed.clone();
+                if let Some(cmd) = managed {
                     clipboard_set(cmd.as_bytes());
+                    self.set_update(|ui| ui.open = false);
                 } else {
-                    self.update = update::State::Downloading(version.clone());
+                    let v = version.clone();
+                    self.set_update(|ui| (ui.state, ui.open) = (update::State::Downloading(v), false));
                     let proxy = self.proxy.clone();
                     std::thread::spawn(move || {
                         let ev = match update::stage(&version) {
@@ -1055,14 +1112,21 @@ impl App {
                 }
             }
             _ => {
-                self.update_open = false;
-                self.notice_changed();
+                self.set_update(|ui| ui.open = false);
                 return false;
             }
         }
-        self.update_open = false;
-        self.notice_changed();
         true
+    }
+
+    /// Change the shared update state and repaint this window (the app repaints the others).
+    fn set_update(&mut self, change: impl FnOnce(&mut UpdateUi)) {
+        {
+            let mut ui = self.ui.borrow_mut();
+            change(&mut ui);
+            ui.generation += 1;
+        }
+        self.notice_changed();
     }
 
     /// Find bar keys. Returns whether the key was consumed (everything is, while the bar is open).
@@ -1169,7 +1233,7 @@ impl App {
                 return;
             }
         }
-        if self.update_open && self.update_key(e) {
+        if self.ui.borrow().open && self.update_key(e) {
             return;
         }
         if self.find.is_some() && self.find_key(e) {
@@ -1447,43 +1511,67 @@ impl App {
     }
 }
 
-impl ApplicationHandler<Ev> for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let (w, h) = match load_state() {
-            Some((w, h, pt)) => {
-                self.font_pt = pt;
-                (w, h)
-            }
-            None => (900.0, 560.0),
-        };
+impl Win {
+    /// Create a window with one tab running `command` (or a login shell). With `join` (macOS) the
+    /// window becomes a native tab of that window.
+    fn create(el: &ActiveEventLoop, proxy: EventLoopProxy<Ev>, ui: Rc<RefCell<UpdateUi>>, command: &[String], cwd: Option<String>, join: Option<&Window>) -> Win {
+        let (w, h, pt) = load_state().unwrap_or((900.0, 560.0, DEFAULT_PT));
         let attrs = Window::default_attributes().with_title("litty").with_inner_size(LogicalSize::new(w, h));
+        #[cfg(target_os = "macos")]
+        let attrs = attrs.with_tabbing_identifier("litty").with_visible(join.is_none());
         let window = Arc::new(el.create_window(attrs).unwrap());
+        #[cfg(target_os = "macos")]
+        if let Some(existing) = join {
+            macos::add_tab(existing, &window);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = join;
         window.set_ime_allowed(true);
-        self.presenter = Some(Presenter::new(&window));
-        self.scale = window.scale_factor() as f32;
-        self.window = Some(window);
-        self.rebuild();
-        let command = self.initial_command.clone();
-        self.new_tab(&command, None);
-        if command.is_empty() && update::enabled() {
-            let proxy = self.proxy.clone();
-            std::thread::spawn(move || update::check(|e| drop(proxy.send_event(Ev::Update(e)))));
-        }
+        let seen_generation = ui.borrow().generation;
+        let mut win = Win {
+            tabs: Vec::new(),
+            active: 0,
+            proxy,
+            seen_generation,
+            ui,
+            closed: false,
+            want: None,
+            mods: ModifiersState::empty(),
+            presenter: Some(Presenter::new(&window)),
+            scale: window.scale_factor() as f32,
+            window: Some(window),
+            renderer: None,
+            font_pt: pt,
+            cursor: (0.0, 0.0),
+            held: None,
+            last_cell: (usize::MAX, usize::MAX),
+            selecting: false,
+            anchor: (0, 0),
+            last_click: None,
+            click_count: 0,
+            wheel_acc: 0.0,
+            ime_pos: (usize::MAX, usize::MAX),
+            next_frame: Instant::now(),
+            frame_deadline: None,
+            blink_on: true,
+            next_blink: Instant::now(),
+            focused: true,
+            rail_drag: false,
+            divider_drag: None,
+            icon: CursorIcon::Default,
+            find: None,
+        };
+        win.rebuild();
+        win.new_tab(command, cwd);
+        win
     }
 
-    fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
-        if let StartCause::ResumeTimeReached { .. } = cause {
-            self.frame_deadline = None;
-            self.redraw_soon();
-        }
+    fn owns(&self, pane: usize) -> bool {
+        self.tabs.iter().any(|t| t.panes.iter().any(|p| p.id == pane))
     }
 
-    /// Sleep until the next thing that needs doing: a postponed frame or a cursor blink.
-    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        let now = Instant::now();
+    /// Blink the cursor, and return when this window next needs waking (a postponed frame or a blink).
+    fn tick(&mut self, now: Instant) -> Option<Instant> {
         let mut deadline = self.frame_deadline;
         let blinking = self.focused && !self.tabs.is_empty() && self.term().lock().unwrap().grid.cursor_blink;
         if blinking {
@@ -1496,45 +1584,11 @@ impl ApplicationHandler<Ev> for App {
             self.blink_on = true;
             self.redraw_soon();
         }
-        el.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+        deadline
     }
 
-    fn user_event(&mut self, el: &ActiveEventLoop, ev: Ev) {
-        match ev {
-            Ev::Wake => self.redraw_soon(),
-            Ev::Exit(id) => {
-                // Ignore panes we already closed ourselves.
-                if let Some(t) = self.tabs.iter().position(|t| t.panes.iter().any(|p| p.id == id)) {
-                    self.close_pane(t, id, false);
-                }
-            }
-            Ev::Quit => el.exit(),
-            Ev::Update(e) => {
-                self.update = match e {
-                    update::Event::Found(v) => {
-                        self.update_managed = update::managed_by();
-                        update::State::Available(v)
-                    }
-                    update::Event::Staged(v, path) => update::State::Staged(v, path),
-                    update::Event::Failed(msg) => update::State::Failed(msg),
-                };
-                self.notice_changed();
-            }
-        }
-    }
-
-    fn exiting(&mut self, _: &ActiveEventLoop) {
-        self.save_state();
-        if let update::State::Staged(_, path) = &self.update {
-            if let Err(e) = update::apply(path) {
-                eprintln!("litty: update failed: {e}");
-            }
-        }
-    }
-
-    fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+    fn on_window_event(&mut self, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(s) => self.resize(s.width, s.height),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor as f32;
@@ -1572,6 +1626,161 @@ impl ApplicationHandler<Ev> for App {
     }
 }
 
+struct App {
+    wins: HashMap<WindowId, Win>,
+    proxy: EventLoopProxy<Ev>,
+    /// Command for the first pane (`-e cmd`); later panes always run a login shell.
+    initial_command: Vec<String>,
+    ui: Rc<RefCell<UpdateUi>>,
+    last_focus: Option<WindowId>,
+}
+
+impl App {
+    /// Open a window (the first one, a new window, or with `join` a native tab of that window).
+    fn add_window(&mut self, el: &ActiveEventLoop, command: &[String], cwd: Option<String>, join: Option<WindowId>) {
+        let existing = join.and_then(|id| self.wins.get(&id)).and_then(|w| w.window.clone());
+        let win = Win::create(el, self.proxy.clone(), self.ui.clone(), command, cwd, existing.as_deref());
+        if let Some(id) = win.window.as_ref().map(|w| w.id()) {
+            self.last_focus = Some(id);
+            self.wins.insert(id, win);
+        }
+    }
+
+    /// After an event: drop closed windows, open requested ones, quit when none are left, and
+    /// repaint windows whose update notice is out of date.
+    fn settle(&mut self, el: &ActiveEventLoop, id: Option<WindowId>) {
+        if let Some(id) = id {
+            let closed = self.wins.get(&id).is_some_and(|w| w.closed);
+            if closed {
+                self.close_window(id);
+            } else if let Some(want) = self.wins.get_mut(&id).and_then(|w| w.want.take()) {
+                match want {
+                    Want::Tab(cwd) => self.add_window(el, &[], cwd, Some(id)),
+                    Want::Window(cwd) => self.add_window(el, &[], cwd, None),
+                }
+            }
+        }
+        let generation = self.ui.borrow().generation;
+        for w in self.wins.values_mut().filter(|w| w.seen_generation != generation) {
+            w.notice_changed();
+        }
+        if self.wins.is_empty() {
+            el.exit();
+        }
+    }
+
+    fn close_window(&mut self, id: WindowId) {
+        if let Some(mut w) = self.wins.remove(&id) {
+            w.shutdown();
+            if self.wins.is_empty() {
+                w.save_state();
+            }
+        }
+    }
+}
+
+impl ApplicationHandler<Ev> for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        if !self.wins.is_empty() {
+            return;
+        }
+        // Tabs are added explicitly (Cmd+T), never merged by the system behind the user's back.
+        #[cfg(target_os = "macos")]
+        el.set_allows_automatic_window_tabbing(false);
+        let command = self.initial_command.clone();
+        self.add_window(el, &command, None, None);
+        if command.is_empty() && update::enabled() {
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || update::check(|e| drop(proxy.send_event(Ev::Update(e)))));
+        }
+    }
+
+    fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::ResumeTimeReached { .. } = cause {
+            for w in self.wins.values_mut() {
+                w.frame_deadline = None;
+                w.redraw_soon();
+            }
+        }
+    }
+
+    /// Sleep until the next thing that needs doing: a postponed frame or a cursor blink.
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        let now = Instant::now();
+        let deadline = self.wins.values_mut().filter_map(|w| w.tick(now)).min();
+        el.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+
+    fn user_event(&mut self, el: &ActiveEventLoop, ev: Ev) {
+        match ev {
+            Ev::Wake(id) => {
+                for w in self.wins.values().filter(|w| w.owns(id)) {
+                    w.redraw_soon();
+                }
+            }
+            Ev::Exit(id) => {
+                // Ignore panes we already closed ourselves.
+                let found = self.wins.iter().find(|(_, w)| w.owns(id)).map(|(wid, _)| *wid);
+                if let Some(wid) = found {
+                    let win = self.wins.get_mut(&wid).expect("window exists");
+                    if let Some(t) = win.tabs.iter().position(|t| t.panes.iter().any(|p| p.id == id)) {
+                        win.close_pane(t, id, false);
+                    }
+                    self.settle(el, Some(wid));
+                }
+            }
+            Ev::Update(e) => {
+                {
+                    let mut ui = self.ui.borrow_mut();
+                    ui.state = match e {
+                        update::Event::Found(v) => {
+                            ui.managed = update::managed_by();
+                            update::State::Available(v)
+                        }
+                        update::Event::Staged(v, path) => update::State::Staged(v, path),
+                        update::Event::Failed(msg) => update::State::Failed(msg),
+                    };
+                    ui.generation += 1;
+                }
+                self.settle(el, None);
+            }
+        }
+    }
+
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        let last = self.last_focus.and_then(|id| self.wins.get(&id)).or_else(|| self.wins.values().next());
+        if let Some(w) = last {
+            w.save_state();
+        }
+        let staged = match &self.ui.borrow().state {
+            update::State::Staged(_, path) => Some(path.clone()),
+            _ => None,
+        };
+        if let Some(path) = staged {
+            if let Err(e) = update::apply(&path) {
+                eprintln!("litty: update failed: {e}");
+            }
+        }
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                self.close_window(id);
+                self.settle(el, None);
+            }
+            event => {
+                if matches!(event, WindowEvent::Focused(true)) {
+                    self.last_focus = Some(id);
+                }
+                let Some(win) = self.wins.get_mut(&id) else { return };
+                win.on_window_event(event);
+                self.settle(el, Some(id));
+            }
+        }
+    }
+}
+
 fn main() {
     // Launched from Finder or the Dock the working directory is "/": start in the home directory.
     if std::env::current_dir().is_ok_and(|d| d == std::path::Path::new("/")) {
@@ -1588,38 +1797,11 @@ fn main() {
     let event_loop = EventLoop::<Ev>::with_user_event().build().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
-        tabs: Vec::new(),
-        active: 0,
-        next_id: 0,
+        wins: HashMap::new(),
         proxy: event_loop.create_proxy(),
         initial_command,
-        mods: ModifiersState::empty(),
-        window: None,
-        presenter: None,
-        renderer: None,
-        font_pt: DEFAULT_PT,
-        scale: 1.0,
-        cursor: (0.0, 0.0),
-        held: None,
-        last_cell: (usize::MAX, usize::MAX),
-        selecting: false,
-        anchor: (0, 0),
-        last_click: None,
-        click_count: 0,
-        wheel_acc: 0.0,
-        ime_pos: (usize::MAX, usize::MAX),
-        next_frame: Instant::now(),
-        frame_deadline: None,
-        blink_on: true,
-        next_blink: Instant::now(),
-        focused: true,
-        rail_drag: false,
-        divider_drag: None,
-        icon: CursorIcon::Default,
-        find: None,
-        update: update::State::None,
-        update_open: false,
-        update_managed: None,
+        ui: Rc::new(RefCell::new(UpdateUi::default())),
+        last_focus: None,
     };
     event_loop.run_app(&mut app).unwrap();
 }

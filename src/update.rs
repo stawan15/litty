@@ -20,8 +20,9 @@ pub enum Event {
     Failed(String),
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Default)]
 pub enum State {
+    #[default]
     None,
     Available(String),
     Downloading(String),
