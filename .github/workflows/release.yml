@@ -59,6 +59,7 @@ jobs:
       TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       LITTY_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+      WEBSITE_DEPLOY_HOOK: ${{ secrets.WEBSITE_DEPLOY_HOOK }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -78,6 +79,10 @@ jobs:
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "litty ${GITHUB_REF_NAME#v}" --generate-notes
           gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
+      - name: Refresh the website
+        # Redeploying litty.teveus.xyz clears its caches, so it shows this release right away.
+        if: env.WEBSITE_DEPLOY_HOOK != ''
+        run: curl -fsS -X POST "$WEBSITE_DEPLOY_HOOK" -o /dev/null
       - name: Homebrew tap
         if: env.TAP_TOKEN != ''
         run: |
