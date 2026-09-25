@@ -7,13 +7,12 @@ class Litty < Formula
   # macOS users: `brew install --cask stawan15/tap/litty` (the app bundle).
   depends_on :linux
 
-  on_intel do
-    url "https://github.com/stawan15/litty/releases/download/v#{version}/litty-#{version}-x86_64-unknown-linux-gnu.tar.gz"
-    sha256 "@LINUX_X86_64_SHA@"
-  end
-  on_arm do
+  if Hardware::CPU.arm?
     url "https://github.com/stawan15/litty/releases/download/v#{version}/litty-#{version}-aarch64-unknown-linux-gnu.tar.gz"
     sha256 "@LINUX_AARCH64_SHA@"
+  else
+    url "https://github.com/stawan15/litty/releases/download/v#{version}/litty-#{version}-x86_64-unknown-linux-gnu.tar.gz"
+    sha256 "@LINUX_X86_64_SHA@"
   end
 
   def install
