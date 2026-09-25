@@ -26,7 +26,7 @@ A small, fast terminal for macOS and Linux. Zero config: no settings file.
 
 ## Updates
 
-litty checks for a newer release once a day (a single request to GitHub; turn it off with
+litty checks for a newer release when it starts, at most once an hour (a single request to GitHub; turn it off with
 `LITTY_NO_UPDATE_CHECK=1`). When one exists a small `↑ litty x.y.z` notice appears in the corner of the
 window. Press Cmd+Shift+U (Ctrl+Shift+U on Linux) to open it: Enter downloads the release in the
 background and installs it when you quit, Esc skips that version. Downloads are verified with an

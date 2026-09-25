@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const CHECK_EVERY: u64 = 24 * 3600;
+const CHECK_EVERY: u64 = 3600;
 /// Public half of the key that signs releases (`examples/sign.rs`).
 const PUBLIC_KEY: [u8; 32] = [0x0b, 0xeb, 0xc3, 0x2a, 0xd0, 0xf1, 0x99, 0x1d, 0xe2, 0x03, 0x39, 0xd5, 0xf2, 0xc6, 0x9e, 0xf2, 0x8b, 0x27, 0xd0, 0xb1, 0x0c, 0x19, 0x4d, 0x16, 0xc7, 0xed, 0x3b, 0xf6, 0x75, 0x97, 0xef, 0xd0];
 
@@ -93,7 +93,7 @@ fn fetch_latest() -> Option<String> {
     parse_version(&tag).map(|_| tag)
 }
 
-/// Report a newer release, asking the network at most once a day.
+/// Report a newer release, asking the network at most once an hour.
 pub fn check(report: impl FnOnce(Event)) {
     let (ts, mut latest, skipped) = read_state();
     if now().saturating_sub(ts) >= CHECK_EVERY {
