@@ -63,6 +63,8 @@ pub struct PaneView<'a> {
     /// False during the "off" half of a blinking cursor.
     pub cursor_on: bool,
     pub find: Option<&'a str>,
+    /// Update notice, drawn in the bottom-right corner of the pane.
+    pub notice: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -227,6 +229,9 @@ impl Renderer {
         g.drawn_cursor_row = g.cy;
         if let Some(q) = view.find {
             self.draw_find_bar(g, q, view.rect);
+        }
+        if let Some(n) = view.notice {
+            self.draw_notice(n, view.rect);
         }
     }
 
@@ -450,6 +455,18 @@ impl Renderer {
         let bx = (rect.x + rect.w).saturating_sub(6 * u + bw).max(rect.x);
         let by = rect.y;
         self.fill(bx, by, bw, bh, 0x7aa2f7);
+        self.fill(bx + u, by + u, bw - 2 * u, bh - 2 * u, 0x24283b);
+        self.text(&label, bx + 4 * u, by + 2 * u, 0xc0caf5);
+    }
+
+    fn draw_notice(&mut self, text: &str, rect: Rect) {
+        let (u, cw, ch) = (self.unit(), self.fonts.cell_w, self.fonts.cell_h);
+        let fit = rect.w.saturating_sub(14 * u) / cw;
+        let label: String = text.chars().take(fit).collect();
+        let (bw, bh) = (label.chars().count() * cw + 8 * u, ch + 4 * u);
+        let bx = (rect.x + rect.w).saturating_sub(6 * u + bw).max(rect.x);
+        let by = (rect.y + rect.h).saturating_sub(bh + 2 * u).max(rect.y);
+        self.fill(bx, by, bw, bh, 0x565f89);
         self.fill(bx + u, by + u, bw - 2 * u, bh - 2 * u, 0x24283b);
         self.text(&label, bx + 4 * u, by + 2 * u, 0xc0caf5);
     }

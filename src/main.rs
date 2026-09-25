@@ -3,6 +3,7 @@ mod font;
 mod grid;
 mod present;
 mod render;
+mod update;
 
 use grid::Grid;
 use nix::libc;
@@ -54,6 +55,8 @@ enum Ev {
     Exit(usize),
     /// Last tab closed.
     Quit,
+    /// Progress of the self-updater.
+    Update(update::Event),
 }
 
 struct Pane {
@@ -229,6 +232,11 @@ struct App {
     icon: CursorIcon,
     /// Find bar query while the bar is open.
     find: Option<String>,
+    update: update::State,
+    /// The update prompt (Cmd+Shift+U) is showing instead of the short notice.
+    update_open: bool,
+    /// The package-manager command for updating, when litty may not replace itself.
+    update_managed: Option<String>,
 }
 
 const DEFAULT_PT: f32 = 14.0;
@@ -587,6 +595,7 @@ impl App {
         } else {
             Vec::new()
         };
+        let notice = self.update_notice();
         let mut attention = false;
         let mut clip = None;
         for pane in self.tabs.iter().flat_map(|t| &t.panes) {
@@ -604,7 +613,7 @@ impl App {
             let focused = *id == tab.active;
             let mut t = pane.term.lock().unwrap();
             let cursor_on = self.blink_on || !t.grid.cursor_blink;
-            let view = PaneView { rect: *rect, focused, cursor_on, find: if focused { self.find.as_deref() } else { None } };
+            let view = PaneView { rect: *rect, focused, cursor_on, find: if focused { self.find.as_deref() } else { None }, notice: if focused { notice.as_deref() } else { None } };
             r.draw_pane(&mut t.grid, &view);
             if focused {
                 title = t.grid.title.take();
@@ -950,6 +959,14 @@ impl App {
             "c" => self.copy(),
             "k" => self.clear_screen(),
             "n" => self.new_window(),
+            "u" if shift => {
+                match self.update {
+                    update::State::None => {}
+                    update::State::Failed(_) => self.update = update::State::None,
+                    _ => self.update_open = !self.update_open,
+                }
+                self.notice_changed();
+            }
             "f" => {
                 self.find = Some(String::new());
                 self.find_changed();
@@ -980,6 +997,71 @@ impl App {
             d if self.mods.super_key() && d.len() == 1 && ("1"..="9").contains(&d) => self.goto_tab(d.parse().unwrap()),
             _ => return false,
         }
+        true
+    }
+
+    /// Text of the update notice: a short pill, or the prompt once opened.
+    fn update_notice(&self) -> Option<String> {
+        let key = if cfg!(target_os = "macos") { "Cmd+Shift+U" } else { "Ctrl+Shift+U" };
+        Some(match &self.update {
+            update::State::None => return None,
+            update::State::Available(v) if !self.update_open => format!("↑ litty {v}  {key}"),
+            update::State::Available(v) => match &self.update_managed {
+                Some(cmd) => format!("litty {v} available · {cmd} · Enter: copy · Esc: skip"),
+                None => format!("litty {v} available · Enter: update on quit · Esc: skip"),
+            },
+            update::State::Downloading(v) => format!("downloading litty {v}…"),
+            update::State::Staged(v, _) => format!("litty {v} ready · installs when you quit"),
+            update::State::Failed(msg) => format!("update failed: {msg} · {key} to dismiss"),
+        })
+    }
+
+    /// Repaint the active tab so the notice appears, changes or disappears.
+    fn notice_changed(&mut self) {
+        for p in &self.tab().panes {
+            p.term.lock().unwrap().grid.dirty.fill(true);
+        }
+        self.redraw_soon();
+    }
+
+    /// Keys while the update prompt is open. Enter and Esc are consumed; any other key closes it.
+    fn update_key(&mut self, e: &KeyEvent) -> bool {
+        let update::State::Available(version) = self.update.clone() else {
+            if matches!(e.logical_key, Key::Named(NamedKey::Escape)) {
+                self.update_open = false;
+                self.notice_changed();
+                return true;
+            }
+            return false;
+        };
+        match &e.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                update::skip(&version);
+                self.update = update::State::None;
+            }
+            Key::Named(NamedKey::Enter) => {
+                if let Some(cmd) = &self.update_managed {
+                    clipboard_set(cmd.as_bytes());
+                } else {
+                    self.update = update::State::Downloading(version.clone());
+                    let proxy = self.proxy.clone();
+                    std::thread::spawn(move || {
+                        let ev = match update::stage(&version) {
+                            Ok(path) => update::Event::Staged(version, path),
+                            Err(msg) => update::Event::Failed(msg),
+                        };
+                        let _ = proxy.send_event(Ev::Update(ev));
+                    });
+                }
+            }
+            _ => {
+                self.update_open = false;
+                self.notice_changed();
+                return false;
+            }
+        }
+        self.update_open = false;
+        self.notice_changed();
         true
     }
 
@@ -1086,6 +1168,9 @@ impl App {
             if self.shortcut(&s.to_lowercase()) {
                 return;
             }
+        }
+        if self.update_open && self.update_key(e) {
+            return;
         }
         if self.find.is_some() && self.find_key(e) {
             return;
@@ -1383,6 +1468,10 @@ impl ApplicationHandler<Ev> for App {
         self.rebuild();
         let command = self.initial_command.clone();
         self.new_tab(&command, None);
+        if command.is_empty() && update::enabled() {
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || update::check(|e| drop(proxy.send_event(Ev::Update(e)))));
+        }
     }
 
     fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
@@ -1420,11 +1509,27 @@ impl ApplicationHandler<Ev> for App {
                 }
             }
             Ev::Quit => el.exit(),
+            Ev::Update(e) => {
+                self.update = match e {
+                    update::Event::Found(v) => {
+                        self.update_managed = update::managed_by();
+                        update::State::Available(v)
+                    }
+                    update::Event::Staged(v, path) => update::State::Staged(v, path),
+                    update::Event::Failed(msg) => update::State::Failed(msg),
+                };
+                self.notice_changed();
+            }
         }
     }
 
     fn exiting(&mut self, _: &ActiveEventLoop) {
         self.save_state();
+        if let update::State::Staged(_, path) = &self.update {
+            if let Err(e) = update::apply(path) {
+                eprintln!("litty: update failed: {e}");
+            }
+        }
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -1512,6 +1617,9 @@ fn main() {
         divider_drag: None,
         icon: CursorIcon::Default,
         find: None,
+        update: update::State::None,
+        update_open: false,
+        update_managed: None,
     };
     event_loop.run_app(&mut app).unwrap();
 }
