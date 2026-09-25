@@ -1,4 +1,5 @@
 mod boxdraw;
+mod config;
 mod emoji;
 mod font;
 mod grid;
@@ -6,6 +7,7 @@ mod grid;
 mod macos;
 mod present;
 mod render;
+mod theme;
 mod update;
 
 use grid::Grid;
@@ -267,6 +269,11 @@ struct Win {
 }
 
 const DEFAULT_PT: f32 = 14.0;
+
+/// Font size when nothing is remembered or zoomed: the config file's, else 14 pt.
+fn default_pt() -> f32 {
+    config::get().font_size.unwrap_or(DEFAULT_PT)
+}
 const PAD_PT: f32 = 10.0;
 /// Minimum time between frames. Drawing holds the grid lock, so capping it keeps the parser
 /// thread fed during floods like `cat bigfile`.
@@ -1052,7 +1059,7 @@ impl Win {
                 self.rebuild();
             }
             "0" | ")" => {
-                self.font_pt = DEFAULT_PT;
+                self.font_pt = default_pt();
                 self.rebuild();
             }
             d if self.mods.super_key() && d.len() == 1 && ("1"..="9").contains(&d) => self.goto_tab(d.parse().unwrap()),
@@ -1524,8 +1531,11 @@ impl Win {
     /// Create a window with one tab running `command` (or a login shell). With `join` (macOS) the
     /// window becomes a native tab of that window.
     fn create(el: &ActiveEventLoop, proxy: EventLoopProxy<Ev>, ui: Rc<RefCell<UpdateUi>>, command: &[String], cwd: Option<String>, join: Option<&Window>) -> Win {
-        let (w, h, pt) = load_state().unwrap_or((900.0, 560.0, DEFAULT_PT));
-        let attrs = Window::default_attributes().with_title("litty").with_inner_size(LogicalSize::new(w, h));
+        let (w, h, saved_pt) = load_state().unwrap_or((900.0, 560.0, DEFAULT_PT));
+        let pt = config::get().font_size.unwrap_or(saved_pt);
+        // The title bar follows the chosen theme instead of the system appearance.
+        let chrome = if config::get().light { winit::window::Theme::Light } else { winit::window::Theme::Dark };
+        let attrs = Window::default_attributes().with_title("litty").with_inner_size(LogicalSize::new(w, h)).with_theme(Some(chrome));
         #[cfg(target_os = "macos")]
         let attrs = attrs.with_tabbing_identifier("litty").with_visible(join.is_none());
         let window = Arc::new(el.create_window(attrs).unwrap());
@@ -1806,6 +1816,7 @@ impl ApplicationHandler<Ev> for App {
 }
 
 fn main() {
+    theme::init(config::get().light);
     // Launched from Finder or the Dock the working directory is "/": start in the home directory.
     if std::env::current_dir().is_ok_and(|d| d == std::path::Path::new("/")) {
         if let Some(home) = std::env::var_os("HOME") {

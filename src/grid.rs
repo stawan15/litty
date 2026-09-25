@@ -82,11 +82,11 @@ impl HLine {
                 }
                 continue;
             }
-            let (fg, bg, attrs) = styles.next().unwrap_or((DEF_FG, DEF_BG, 0));
+            let (fg, bg, attrs) = styles.next().unwrap_or((def_fg(), def_bg(), 0));
             base = Some(out.len());
             out.push(Cell { ch, comb: ['\0'; 2], fg, bg, attrs });
             if ch.width() == Some(2) {
-                let (fg, bg, attrs) = styles.next().unwrap_or((DEF_FG, DEF_BG, 0));
+                let (fg, bg, attrs) = styles.next().unwrap_or((def_fg(), def_bg(), 0));
                 out.push(Cell { ch: '\0', comb: ['\0'; 2], fg, bg, attrs });
             }
         }
@@ -94,17 +94,35 @@ impl HLine {
 }
 
 // Tokyo Night palette.
-pub const DEF_FG: u32 = 0xc0caf5;
-pub const DEF_BG: u32 = 0x1a1b26;
 
-pub const ANSI: [u32; 16] = [
-    0x15161e, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xa9b1d6, 0x414868,
-    0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5,
-];
+/// The cursor shape and blinking chosen in the config file (a steady block by default).
+fn default_cursor() -> (CursorShape, bool) {
+    let c = crate::config::get();
+    (
+        match c.cursor {
+            1 => CursorShape::Underline,
+            2 => CursorShape::Bar,
+            _ => CursorShape::Block,
+        },
+        c.cursor_blink,
+    )
+}
+
+pub fn def_fg() -> u32 {
+    crate::theme::theme().fg
+}
+
+pub fn def_bg() -> u32 {
+    crate::theme::theme().bg
+}
+
+pub fn ansi() -> &'static [u32; 16] {
+    &crate::theme::theme().ansi
+}
 
 fn xterm256(n: u8) -> u32 {
     match n {
-        0..=15 => ANSI[n as usize],
+        0..=15 => ansi()[n as usize],
         16..=231 => {
             let i = n - 16;
             let f = |v: u8| if v == 0 { 0 } else { 55 + v as u32 * 40 };
@@ -205,7 +223,7 @@ impl Grid {
     }
 
     pub fn new(cols: usize, rows: usize) -> Self {
-        let blank = Cell::blank(DEF_FG, DEF_BG);
+        let blank = Cell::blank(def_fg(), def_bg());
         Grid {
             cols,
             rows,
@@ -214,8 +232,8 @@ impl Grid {
             cy: 0,
             dirty: vec![true; rows],
             cursor_visible: true,
-            cursor_shape: CursorShape::Block,
-            cursor_blink: false,
+            cursor_shape: default_cursor().0,
+            cursor_blink: default_cursor().1,
             drawn_cursor_row: 0,
             drawn_scroll: 0,
             app_cursor: false,
@@ -240,8 +258,8 @@ impl Grid {
             matches: Vec::new(),
             cur_match: 0,
             attention: false,
-            pen_fg: DEF_FG,
-            pen_bg: DEF_BG,
+            pen_fg: def_fg(),
+            pen_bg: def_bg(),
             pen_rev: false,
             pen_attrs: 0,
             top: 0,
@@ -263,7 +281,7 @@ impl Grid {
             self.reflow(cols, rows);
             return;
         }
-        let blank = Cell::blank(DEF_FG, DEF_BG);
+        let blank = Cell::blank(def_fg(), def_bg());
         let (old_cols, old_rows) = (self.cols, self.rows);
         // Both screens are resized, so the main screen survives a resize while in the alternate one.
         let copy = |src: &[Cell], off: usize| {
@@ -292,8 +310,8 @@ impl Grid {
     /// while keeping the cursor on the same text. Rows that no longer fit at the top move into
     /// scrollback (scrollback itself is not re-wrapped). Marks are remapped to the new rows.
     fn reflow(&mut self, cols: usize, rows: usize) {
-        let blank = Cell::blank(DEF_FG, DEF_BG);
-        let is_blank = |c: &Cell| c.ch == ' ' && c.bg == DEF_BG && c.attrs & UNDERLINE == 0;
+        let blank = Cell::blank(def_fg(), def_bg());
+        let is_blank = |c: &Cell| c.ch == ' ' && c.bg == def_bg() && c.attrs & UNDERLINE == 0;
         let (old_cols, old_rows) = (self.cols, self.rows);
         let pushed_old = self.pushed;
         let pending = self.cx >= old_cols;
@@ -421,7 +439,7 @@ impl Grid {
     /// Append `row` to scrollback (associated fn so callers can borrow `cells` at the same time).
     fn push_line(history: &mut VecDeque<HLine>, pushed: &mut u64, marks: &mut VecDeque<Mark>, scroll: &mut usize, row: &[Cell]) {
         // Drop trailing blanks so history stays small for typical short lines.
-        let len = row.iter().rposition(|x| !(x.ch == ' ' && x.bg == DEF_BG && x.attrs & UNDERLINE == 0)).map_or(0, |i| i + 1);
+        let len = row.iter().rposition(|x| !(x.ch == ' ' && x.bg == def_bg() && x.attrs & UNDERLINE == 0)).map_or(0, |i| i + 1);
         // At capacity, recycle the evicted line's allocation.
         let mut line = if history.len() == HISTORY_CAP { history.pop_front().unwrap_or_default() } else { HLine::default() };
         line.encode(&row[..len]);
@@ -456,7 +474,7 @@ impl Grid {
         buf.clear();
         self.history[v].decode(buf);
         buf.truncate(self.cols);
-        buf.resize(self.cols, Cell::blank(DEF_FG, DEF_BG));
+        buf.resize(self.cols, Cell::blank(def_fg(), def_bg()));
         buf
     }
 
@@ -611,7 +629,7 @@ impl Grid {
 
     /// Cmd+K: wipe screen, scrollback and command blocks.
     pub fn clear_all(&mut self) {
-        let blank = Cell::blank(DEF_FG, DEF_BG);
+        let blank = Cell::blank(def_fg(), def_bg());
         self.cells.fill(blank);
         self.history.clear();
         self.marks.clear();
@@ -782,7 +800,7 @@ impl Grid {
         std::mem::swap(&mut self.off, &mut self.alt_off);
         if on {
             self.saved = (self.cx, self.cy);
-            let blank = Cell::blank(DEF_FG, DEF_BG);
+            let blank = Cell::blank(def_fg(), def_bg());
             self.cells.fill(blank);
         } else {
             (self.cx, self.cy) = self.saved;
@@ -822,12 +840,12 @@ impl Grid {
                 23 => self.pen_attrs &= !ITALIC,
                 24 => self.pen_attrs &= !UNDERLINE,
                 27 => self.pen_rev = false,
-                30..=37 => self.pen_fg = ANSI[(c - 30) as usize],
-                39 => self.pen_fg = DEF_FG,
-                40..=47 => self.pen_bg = ANSI[(c - 40) as usize],
-                49 => self.pen_bg = DEF_BG,
-                90..=97 => self.pen_fg = ANSI[(c - 90) as usize + 8],
-                100..=107 => self.pen_bg = ANSI[(c - 100) as usize + 8],
+                30..=37 => self.pen_fg = ansi()[(c - 30) as usize],
+                39 => self.pen_fg = def_fg(),
+                40..=47 => self.pen_bg = ansi()[(c - 40) as usize],
+                49 => self.pen_bg = def_bg(),
+                90..=97 => self.pen_fg = ansi()[(c - 90) as usize + 8],
+                100..=107 => self.pen_bg = ansi()[(c - 100) as usize + 8],
                 38 | 48 => {
                     if let Some(col) = extended_color(&mut it.by_ref().map(|s| s[0])) {
                         if c == 38 { self.pen_fg = col } else { self.pen_bg = col }
@@ -839,7 +857,7 @@ impl Grid {
     }
 
     fn reset_pen(&mut self) {
-        (self.pen_fg, self.pen_bg, self.pen_rev, self.pen_attrs) = (DEF_FG, DEF_BG, false, 0);
+        (self.pen_fg, self.pen_bg, self.pen_rev, self.pen_attrs) = (def_fg(), def_bg(), false, 0);
     }
 
     fn set_mode(&mut self, params: &Params, on: bool) {
@@ -989,7 +1007,7 @@ impl Perform for Grid {
         match params {
             // Colour queries (neovim, bat, delta ask for the background to pick a theme).
             [code @ (b"10" | b"11" | b"12"), b"?", ..] => {
-                let color = if *code == b"11" { DEF_BG } else { DEF_FG };
+                let color = if *code == b"11" { def_bg() } else { def_fg() };
                 self.osc_color_reply(&String::from_utf8_lossy(code), color, bell);
             }
             [b"4", rest @ ..] => {
@@ -1045,14 +1063,18 @@ impl Perform for Grid {
         let n = param(params, 0, 1);
         match (inter, action) {
             ([b' '], 'q') => {
-                // DECSCUSR: 0/1 blinking block, 2 steady block, 3/4 underline, 5/6 bar.
+                // DECSCUSR: 0 the configured default, 1 blinking block, 2 steady block, 3/4 underline, 5/6 bar.
                 let style = raw(params, 0);
-                self.cursor_shape = match style {
-                    3 | 4 => CursorShape::Underline,
-                    5 | 6 => CursorShape::Bar,
-                    _ => CursorShape::Block,
+                (self.cursor_shape, self.cursor_blink) = if style == 0 {
+                    default_cursor()
+                } else {
+                    let shape = match style {
+                        3 | 4 => CursorShape::Underline,
+                        5 | 6 => CursorShape::Bar,
+                        _ => CursorShape::Block,
+                    };
+                    (shape, matches!(style, 1 | 3 | 5))
                 };
-                self.cursor_blink = matches!(style, 1 | 3 | 5);
             }
             // DECRQM: applications ask whether a mode is supported before relying on it.
             ([b'?', b'$'], 'p') => {
@@ -1236,9 +1258,9 @@ mod tests {
     fn sgr_colors_and_reset() {
         let mut g = Grid::new(4, 1);
         feed(&mut g, "\x1b[31ma\x1b[38;2;1;2;3mb\x1b[0mc");
-        assert_eq!(g.row(0)[0].fg, ANSI[1]);
+        assert_eq!(g.row(0)[0].fg, ansi()[1]);
         assert_eq!(g.row(0)[1].fg, 0x010203);
-        assert_eq!(g.row(0)[2].fg, DEF_FG);
+        assert_eq!(g.row(0)[2].fg, def_fg());
     }
 
     #[test]
@@ -1335,10 +1357,10 @@ mod tests {
         g.scroll_view(2);
         let mut buf = Vec::new();
         let row = g.view_row(0, &mut buf).to_vec();
-        assert_eq!((row[0].ch, row[0].comb[0], row[0].attrs, row[0].fg), ('ก', '\u{0e48}', BOLD, ANSI[1]));
-        assert_eq!((row[1].ch, row[1].fg), ('า', ANSI[1]));
+        assert_eq!((row[0].ch, row[0].comb[0], row[0].attrs, row[0].fg), ('ก', '\u{0e48}', BOLD, ansi()[1]));
+        assert_eq!((row[1].ch, row[1].fg), ('า', ansi()[1]));
         assert_eq!((row[3].ch, row[4].ch, row[5].ch), ('日', '\0', 'x'));
-        assert_eq!(row[3].fg, DEF_FG);
+        assert_eq!(row[3].fg, def_fg());
     }
 
     #[test]

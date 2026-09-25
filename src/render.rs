@@ -1,29 +1,14 @@
 use unicode_width::UnicodeWidthChar;
 use crate::font::{Fonts, Glyph};
-use crate::grid::{ANSI, BOLD, Cell, CursorShape, DEF_BG, Grid, ITALIC, Mark, UNDERLINE};
+use crate::grid::{BOLD, Cell, CursorShape, Grid, ITALIC, Mark, UNDERLINE, ansi, def_bg};
+use crate::theme::theme;
 
-const SEL_BG: u32 = 0x33467c;
-const MATCH_BG: u32 = 0x54432a;
-const CUR_MATCH_BG: u32 = 0xe0af68;
-const FAIL_TINT: u32 = 0x29212d;
 
-const FAIL_TEXT: u32 = 0xf7768e;
-const ACCENT: u32 = 0x7aa2f7;
 
 // Tab bar.
-const DIVIDER: u32 = 0x2f334d;
-const CURSOR_BAR: u32 = 0xc0caf5;
 
-const BAR_BG: u32 = 0x16161e;
-const TAB_TEXT: u32 = 0x565f89;
-const TAB_TEXT_ACTIVE: u32 = 0xc0caf5;
 
-const RAIL_TRACK: u32 = 0x1f2130;
-const RAIL_THUMB: u32 = 0x414868;
-const RAIL_THUMB_ACTIVE: u32 = ACCENT;
-const MATCH_TICK: u32 = 0xe0af68;
 
-const BADGE_OK: u32 = 0x565f89;
 
 fn failed(m: &Mark) -> bool {
     m.end.is_some() && m.exit != Some(0)
@@ -179,7 +164,7 @@ impl Renderer {
     pub fn resize(&mut self, w: usize, h: usize) {
         self.w = w;
         self.h = h;
-        self.fb = vec![DEF_BG; w * h];
+        self.fb = vec![def_bg(); w * h];
         self.damage = Some((0, h));
         self.clip = [0, 0, w, h];
     }
@@ -201,7 +186,7 @@ impl Renderer {
 
     /// Forget everything drawn so far (layout changed): the next draws repaint from scratch.
     pub fn clear(&mut self) {
-        self.fb.fill(DEF_BG);
+        self.fb.fill(def_bg());
         self.damage = Some((0, self.h));
     }
 
@@ -264,7 +249,7 @@ impl Renderer {
             let (w, h) = (d.w.min(u), d.h.min(u));
             let (x, y) = (d.x + (d.w - w) / 2, d.y + (d.h - h) / 2);
             // The rect is a gap between panes: draw a hairline through its middle along its length.
-            if d.w < d.h { self.fill(x, d.y, w, d.h, DIVIDER) } else { self.fill(d.x, y, d.w, h, DIVIDER) }
+            if d.w < d.h { self.fill(x, d.y, w, d.h, theme().divider) } else { self.fill(d.x, y, d.w, h, theme().divider) }
         }
         if let Some(g) = rail {
             self.draw_rail(g);
@@ -293,18 +278,18 @@ impl Renderer {
             let mut fg = c.fg;
             // Bold text uses the bright variant of the 8 base colours.
             if c.attrs & BOLD != 0 {
-                if let Some(i) = ANSI[..8].iter().position(|&a| a == fg) {
-                    fg = ANSI[i + 8];
+                if let Some(i) = ansi()[..8].iter().position(|&a| a == fg) {
+                    fg = ansi()[i + 8];
                 }
             }
-            let mut bg = if tint && c.bg == DEF_BG { FAIL_TINT } else { c.bg };
+            let mut bg = if tint && c.bg == def_bg() { theme().fail_tint } else { c.bg };
             if let Some(m) = matches.iter().find(|m| x >= m.1 && x < m.1 + m.2) {
-                (fg, bg) = if Some(*m) == current { (DEF_BG, CUR_MATCH_BG) } else { (fg, MATCH_BG) };
+                (fg, bg) = if Some(*m) == current { (def_bg(), theme().cur_match_bg) } else { (fg, theme().match_bg) };
             }
             let (fg, bg) = if has_cursor && x == cursor_x {
                 (c.bg, c.fg)
             } else if sel.is_some_and(|(a, b)| x >= a && x < b) {
-                (fg, SEL_BG)
+                (fg, theme().sel_bg)
             } else {
                 (fg, bg)
             };
@@ -354,7 +339,7 @@ impl Renderer {
             let (cx0, u) = (ox + cursor_x * cw, self.unit());
             if !focused {
                 // Hollow block so an inactive pane still shows where its cursor is.
-                let cell_fg = mix_color(line[cursor_x].fg, DEF_BG, 90);
+                let cell_fg = mix_color(line[cursor_x].fg, def_bg(), 90);
                 self.fill(cx0, oy, cw, u, cell_fg);
                 self.fill(cx0, oy + ch - u, cw, u, cell_fg);
                 self.fill(cx0, oy, u, ch, cell_fg);
@@ -362,16 +347,16 @@ impl Renderer {
             } else if view.cursor_on {
                 match g.cursor_shape {
                     CursorShape::Block => {}
-                    CursorShape::Underline => self.fill(cx0, oy + ch - 2 * u, cw, 2 * u, CURSOR_BAR),
-                    CursorShape::Bar => self.fill(cx0, oy, 2 * u, ch, CURSOR_BAR),
+                    CursorShape::Underline => self.fill(cx0, oy + ch - 2 * u, cw, 2 * u, theme().cursor_bar),
+                    CursorShape::Bar => self.fill(cx0, oy, 2 * u, ch, theme().cursor_bar),
                 }
             }
         }
         // Exit status / duration on the command line, if there is room.
         if let Some(text) = mark.filter(|m| m.out.is_some_and(|o| o == id + 1)).and_then(badge) {
             let n = text.chars().count();
-            if n + 2 <= line.len() && line[line.len() - n - 2..].iter().all(|c| c.ch == ' ' && c.bg == DEF_BG) {
-                let color = if mark.is_some_and(failed) { FAIL_TEXT } else { BADGE_OK };
+            if n + 2 <= line.len() && line[line.len() - n - 2..].iter().all(|c| c.ch == ' ' && c.bg == def_bg()) {
+                let color = if mark.is_some_and(failed) { theme().fail_text } else { theme().badge_ok };
                 self.text(&text, ox + (line.len() - n - 1) * cw, oy, color);
             }
         }
@@ -393,23 +378,23 @@ impl Renderer {
             return;
         }
         let th = y1 - y0;
-        self.fill(rx, self.bar_h, rw, self.h - self.bar_h, DEF_BG);
+        self.fill(rx, self.bar_h, rw, self.h - self.bar_h, def_bg());
         let hist = g.history_len();
         if hist == 0 {
             return;
         }
         let total = hist + g.rows;
         let at = |line: u64| y0 + ((line - (g.pushed - hist as u64)) as usize * th / total).min(th - 1);
-        self.fill(rx, y0, rw, th, RAIL_TRACK);
+        self.fill(rx, y0, rw, th, theme().rail_track);
         for m in g.marks.iter().filter(|m| failed(m) && m.start + hist as u64 >= g.pushed) {
-            self.fill(rx, at(m.start), rw, (2 * u).min(th), FAIL_TEXT);
+            self.fill(rx, at(m.start), rw, (2 * u).min(th), theme().fail_text);
         }
         for &(id, ..) in g.matches.iter().filter(|m| m.0 + hist as u64 >= g.pushed) {
-            self.fill(rx, at(id), rw, u, MATCH_TICK);
+            self.fill(rx, at(id), rw, u, theme().match_tick);
         }
         let ty = y0 + (hist - g.scroll) * th / total;
         let len = (g.rows * th / total).max(12 * u).min(th);
-        let color = if g.scroll > 0 { RAIL_THUMB_ACTIVE } else { RAIL_THUMB };
+        let color = if g.scroll > 0 { theme().accent } else { theme().rail_thumb };
         // Thumb is drawn inset so ticks stay visible on both sides.
         self.fill(rx + u, ty.min(y1 - len), rw - 2 * u, len, color);
     }
@@ -444,14 +429,14 @@ impl Renderer {
     fn draw_tabs(&mut self, titles: &[String], active: usize) {
         let (u, cw, ch) = (self.unit(), self.fonts.cell_w, self.fonts.cell_h);
         let (tw, plus) = self.tab_widths(titles.len());
-        self.fill(0, 0, self.w, self.bar_h, BAR_BG);
+        self.fill(0, 0, self.w, self.bar_h, theme().bar_bg);
         let ty = (self.bar_h - ch) / 2;
         for (i, title) in titles.iter().enumerate() {
             let x = i * tw;
             let on = i == active;
             if on {
-                self.fill(x, 0, tw, self.bar_h, DEF_BG);
-                self.fill(x, 0, tw, 2 * u, ACCENT);
+                self.fill(x, 0, tw, self.bar_h, def_bg());
+                self.fill(x, 0, tw, 2 * u, theme().accent);
             }
             let room = (tw / cw).saturating_sub(5).max(1);
             let label: String = if title.chars().count() > room {
@@ -459,12 +444,12 @@ impl Renderer {
             } else {
                 title.clone()
             };
-            let color = if on { TAB_TEXT_ACTIVE } else { TAB_TEXT };
+            let color = if on { theme().tab_text_active } else { theme().tab_text };
             self.text(&label, x + 2 * cw, ty, color);
-            self.text("×", x + tw - 2 * cw, ty, TAB_TEXT);
+            self.text("×", x + tw - 2 * cw, ty, theme().tab_text);
         }
         let px = titles.len() * tw;
-        self.text("+", px + (plus.saturating_sub(cw)) / 2, ty, TAB_TEXT);
+        self.text("+", px + (plus.saturating_sub(cw)) / 2, ty, theme().tab_text);
     }
 
     fn draw_find_bar(&mut self, g: &Grid, query: &str, rect: Rect) {
@@ -478,9 +463,9 @@ impl Renderer {
         let (bw, bh) = (label.chars().count() * cw + 8 * u, ch + 4 * u);
         let bx = (rect.x + rect.w / cw * cw).saturating_sub(2 * u + bw).max(rect.x);
         let by = rect.y;
-        self.fill(bx, by, bw, bh, 0x7aa2f7);
-        self.fill(bx + u, by + u, bw - 2 * u, bh - 2 * u, 0x24283b);
-        self.text(&label, bx + 4 * u, by + 2 * u, 0xc0caf5);
+        self.fill(bx, by, bw, bh, theme().accent);
+        self.fill(bx + u, by + u, bw - 2 * u, bh - 2 * u, theme().panel_bg);
+        self.text(&label, bx + 4 * u, by + 2 * u, theme().fg);
     }
 
     /// Draw `ch` as a colour emoji in the two cells at (x, y); false if the emoji font lacks it.
@@ -502,9 +487,9 @@ impl Renderer {
         // Inside the rows of the grid (not its leftover pixels), so repainting the rows erases it.
         let bx = (rect.x + rect.w / cw * cw).saturating_sub(2 * u + bw).max(rect.x);
         let by = (rect.y + rect.h / ch * ch).saturating_sub(bh).max(rect.y);
-        self.fill(bx, by, bw, bh, 0x565f89);
-        self.fill(bx + u, by + u, bw - 2 * u, bh - 2 * u, 0x24283b);
-        self.text(&label, bx + 4 * u, by + 2 * u, 0xc0caf5);
+        self.fill(bx, by, bw, bh, theme().tab_text);
+        self.fill(bx + u, by + u, bw - 2 * u, bh - 2 * u, theme().panel_bg);
+        self.text(&label, bx + 4 * u, by + 2 * u, theme().fg);
     }
 
     /// Draw a single line of text at pixel (x, y) using the monospace grid.

@@ -24,6 +24,27 @@ A small, fast terminal for macOS and Linux. Zero config: no settings file.
     cargo run --release            # login shell
     cargo run --release -- -e cmd  # run a command instead
 
+## Configuration (optional)
+
+litty needs no configuration. To change a default, create `~/.config/litty/config`
+(`$XDG_CONFIG_HOME/litty/config`), one `key = value` per line, `#` for comments:
+
+    theme = dark          # dark | light | auto (auto follows the system appearance at startup)
+    font-size = 14        # points; overrides the zoom remembered from the last session
+    cursor = block        # block | bar | underline
+    cursor-blink = false
+
+Changes apply the next time litty starts.
+
+## Terminal features
+
+Truecolor, 256 colours, bold/italic/underline, wide characters and combining marks (Thai), colour
+emoji (single code points: ZWJ sequences, skin tones and flags show their parts), mouse reporting
+(SGR), bracketed paste, focus events (1004), synchronized output (2026), OSC 7/8/52/133, colour
+queries (OSC 4/10/11/12) and DECRQM mode queries, DSR, alternate screen, scrollback with reflow.
+Not supported yet: images (sixel / Kitty graphics) and the Kitty keyboard protocol (queries are
+answered as "no enhancements").
+
 ## Updates
 
 litty checks for a newer release when it starts, at most once an hour (a single request to GitHub; turn it off with
@@ -38,8 +59,9 @@ Nix, cargo), the notice shows the command to run instead and Enter copies it.
 - **Command blocks.** With zsh (auto-enabled) or any shell that emits OSC 133, failed commands
   get a faint red tint on their output, and slow or failing commands show `exit N  1.2s` at the
   end of the command line. Cmd+Up / Cmd+Down jump between prompts.
-- **Tabs and splits.** Cmd+T opens a tab in the current directory (the tab bar appears with the
-  second tab). Cmd+D splits right, Cmd+Shift+D splits down; drag a divider to resize; inactive
+- **Tabs and splits.** Cmd+T opens a tab in the current directory. On macOS tabs are native window
+  tabs (real NSWindows in one tab group: drag to detach, Mission Control, the system tab bar); on
+  Linux litty draws its own tab bar. Cmd+D splits right, Cmd+Shift+D splits down; drag a divider to resize; inactive
   panes are dimmed. Cmd+Shift+Enter zooms one pane.
 - **Reflow.** Resizing re-wraps lines (prompts stay intact), keeping the cursor on its text.
 - **Ligatures** (`=>`, `!=`, `->`, `<=`, `|>`, ...) with Maple Mono, plus bold-as-bright colours,
