@@ -32,6 +32,16 @@ pub struct Mark {
     pub exit: Option<i32>,
     pub started: Option<Instant>,
     pub took: Option<Duration>,
+    /// The command line, when the shell reports it (`OSC 133;C;cmdline_url=...`).
+    pub command: Option<String>,
+}
+
+/// A slow command that just finished; taken by the app (Dock bounce, tray, notification).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Finished {
+    pub command: Option<String>,
+    pub exit: i32,
+    pub took: Duration,
 }
 
 /// Commands slower than this ask for attention if the window is in the background.
@@ -199,7 +209,7 @@ pub struct Grid {
     pub matches: Vec<(u64, usize, usize)>,
     pub cur_match: usize,
     /// Set when a long command finishes; taken by the app.
-    pub attention: bool,
+    pub finished: Option<Finished>,
     pen_fg: u32,
     pen_bg: u32,
     pen_rev: bool,
@@ -257,7 +267,7 @@ impl Grid {
             marks: VecDeque::new(),
             matches: Vec::new(),
             cur_match: 0,
-            attention: false,
+            finished: None,
             pen_fg: def_fg(),
             pen_bg: def_bg(),
             pen_rev: false,
@@ -541,10 +551,11 @@ impl Grid {
     fn semantic_prompt(&mut self, kind: &[u8], rest: &[&[u8]]) {
         let line = self.pushed + self.cy as u64;
         match kind {
-            b"A" => self.marks.push_back(Mark { start: line, out: None, end: None, exit: None, started: None, took: None }),
+            b"A" => self.marks.push_back(Mark { start: line, out: None, end: None, exit: None, started: None, took: None, command: None }),
             b"C" => {
                 if let Some(m) = self.marks.back_mut().filter(|m| m.out.is_none()) {
                     (m.out, m.started) = (Some(line), Some(Instant::now()));
+                    m.command = rest.iter().find_map(|p| p.strip_prefix(b"cmdline_url=")).map(percent_decode).filter(|c| !c.is_empty());
                 }
             }
             b"D" => match self.marks.back_mut() {
@@ -556,7 +567,9 @@ impl Grid {
                     m.end = Some(line);
                     m.exit = Some(rest.first().and_then(|c| std::str::from_utf8(c).ok()?.parse().ok()).unwrap_or(0));
                     m.took = m.started.map(|t| t.elapsed());
-                    self.attention |= m.took.is_some_and(|t| t >= LONG_COMMAND);
+                    if let Some(took) = m.took.filter(|&t| t >= LONG_COMMAND) {
+                        self.finished = Some(Finished { command: m.command.clone(), exit: m.exit.unwrap_or(0), took });
+                    }
                     self.dirty.fill(true);
                 }
                 _ => {}
@@ -662,6 +675,21 @@ impl Grid {
             self.sel = Some(((id, col), (id, self.cols - 1)));
             return;
         };
+        if crate::thai::is_thai(here.ch) {
+            // Thai has no spaces: pick the dictionary word under the click within the Thai run.
+            let thai = |c: &Cell| crate::thai::is_thai(c.ch);
+            let (mut a, mut b) = (col, col);
+            while a > 0 && thai(&line[a - 1]) {
+                a -= 1;
+            }
+            while b + 1 < line.len() && thai(&line[b + 1]) {
+                b += 1;
+            }
+            let cells: Vec<Vec<char>> = line[a..=b].iter().map(|c| std::iter::once(c.ch).chain(c.comb.iter().copied().filter(|&m| m != '\0')).collect()).collect();
+            let (s, e) = crate::thai::words(&cells).into_iter().find(|&(s, e)| (s..e).contains(&(col - a))).unwrap_or((0, cells.len()));
+            self.sel = Some(((id, a + s), (id, a + e - 1)));
+            return;
+        }
         let k = class(here);
         let (mut a, mut b) = (col, col);
         if k != 2 {
@@ -713,6 +741,31 @@ impl Grid {
         let i = self.marks.partition_point(|m| m.start <= id).checked_sub(1)?;
         let m = &self.marks[i];
         (id < m.end.unwrap_or(self.pushed + self.cy as u64 + 1)).then_some(m)
+    }
+
+    /// Output lines `[out, end)` of a command block; a running command's output ends at the cursor.
+    fn output_lines(&self, m: &Mark) -> Option<(u64, u64)> {
+        let out = m.out?;
+        let end = m.end.unwrap_or(self.pushed + self.cy as u64 + 1);
+        (end > out).then_some((out, end))
+    }
+
+    /// Cmd-click on a prompt line (`id`): select that command's output. Returns false when `id`
+    /// isn't a prompt line or the command printed nothing.
+    pub fn select_output_from_prompt(&mut self, id: u64) -> bool {
+        let lines = self.mark_at(id).filter(|m| m.out.is_some_and(|o| id < o)).and_then(|m| self.output_lines(m));
+        let Some((out, end)) = lines else { return false };
+        self.sel = Some(((out, 0), (end - 1, self.cols - 1)));
+        self.dirty.fill(true);
+        true
+    }
+
+    /// Select the output of the last command that produced any (Cmd+Shift+C copies it).
+    pub fn select_last_output(&mut self) -> bool {
+        let Some((out, end)) = self.marks.iter().rev().find_map(|m| self.output_lines(m)) else { return false };
+        self.sel = Some(((out, 0), (end - 1, self.cols - 1)));
+        self.dirty.fill(true);
+        true
     }
 
     fn blank(&self) -> Cell {
@@ -907,6 +960,26 @@ fn colon_color(s: &[u16]) -> Option<u32> {
 }
 
 /// Path part of a `file://host/path` URI (OSC 7), percent-decoded.
+/// Decode `%XX` escapes (invalid UTF-8 is replaced), capped at 200 characters.
+fn percent_decode(s: &[u8]) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (s[i], s.get(i + 1).copied().and_then(hex), s.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (b, ..) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).chars().filter(|c| !c.is_control() && *c != '\u{fffd}').take(200).collect()
+}
+
 fn file_uri_path(uri: &[u8]) -> Option<String> {
     let rest = uri.strip_prefix(b"file://")?;
     let path = &rest[rest.iter().position(|&b| b == b'/')?..];
@@ -1366,6 +1439,49 @@ mod tests {
         assert_eq!((row[1].ch, row[1].fg), ('า', ansi()[1]));
         assert_eq!((row[3].ch, row[4].ch, row[5].ch), ('日', '\0', 'x'));
         assert_eq!(row[3].fg, def_fg());
+    }
+
+    #[test]
+    fn command_line_and_block_output() {
+        let mut g = Grid::new(20, 8);
+        feed(&mut g, "\x1b]133;A\x07$ ls x\r\n\x1b]133;C;cmdline_url=ls%20x%7C%E0%B8%81\x07one\r\ntwo  \r\n\x1b]133;D;1\x07\x1b]133;A\x07$ ");
+        let m = &g.marks[0];
+        assert_eq!(m.command.as_deref(), Some("ls x|ก"));
+        assert_eq!(m.exit, Some(1));
+        // A quick command is not reported as finished.
+        assert!(g.finished.is_none());
+        // Cmd+Shift+C: the last output, without prompt or trailing blanks.
+        assert!(g.select_last_output());
+        assert_eq!(g.selection_text().as_deref(), Some("one\ntwo"));
+        // Cmd-click on the prompt line selects the same; on an output line it does nothing.
+        g.sel = None;
+        assert!(!g.select_output_from_prompt(1));
+        assert!(g.select_output_from_prompt(0));
+        assert_eq!(g.selection_text().as_deref(), Some("one\ntwo"));
+        // The new prompt has no output yet: the last output is still the previous command's.
+        assert!(g.select_last_output());
+        assert_eq!(g.selection_text().as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn double_click_selects_one_thai_word() {
+        let mut g = Grid::new(30, 3);
+        feed(&mut g, "echo สวัสดีครับ ok");
+        // Columns: "echo " 0-4, then สวัสดี (5 cells: ส วั ส ดี... ) and ครับ.
+        let text = |g: &Grid| g.selection_text().unwrap();
+        g.select_word(g.abs_row(0), 6);
+        assert_eq!(text(&g), "สวัสดี");
+        g.select_word(g.abs_row(0), 10);
+        assert_eq!(text(&g), "ครับ");
+        g.select_word(g.abs_row(0), 0);
+        assert_eq!(text(&g), "echo");
+    }
+
+    #[test]
+    fn percent_decoding_is_forgiving() {
+        assert_eq!(percent_decode(b"a%20b%zz%"), "a b%zz%");
+        assert_eq!(percent_decode(b"%1b%5b2J"), "[2J"); // control characters are dropped
+        assert_eq!(percent_decode(&b"x".repeat(500)).len(), 200);
     }
 
     #[test]

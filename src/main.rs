@@ -6,7 +6,9 @@ mod grid;
 #[cfg(target_os = "macos")]
 mod macos;
 mod present;
+mod record;
 mod render;
+mod thai;
 mod theme;
 mod update;
 
@@ -56,6 +58,8 @@ fn debug_log(tag: &str, bytes: &[u8]) {
 struct Term {
     grid: Grid,
     parser: Parser,
+    /// Cmd+Shift+R: this pane's output is being saved as an asciinema cast.
+    recorder: Option<record::Recorder>,
 }
 
 enum Ev {
@@ -228,6 +232,24 @@ struct UpdateUi {
     generation: u64,
 }
 
+/// "45s", "2m13s", "1h04m".
+fn took_text(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s / 60 % 60),
+    }
+}
+
+/// Desktop notification on Linux, when `notify-send` is installed.
+#[cfg(not(target_os = "macos"))]
+fn notify_send(title: &str, body: &str) {
+    if let Ok(mut child) = Command::new("notify-send").args(["-a", "litty", title, body]).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        std::thread::spawn(move || child.wait());
+    }
+}
+
 /// Act on an available update: copy the package manager's command, or download and stage the
 /// release in the background (it is swapped in when litty quits).
 fn install_update(ui: &RefCell<UpdateUi>, proxy: &EventLoopProxy<Ev>) {
@@ -297,6 +319,8 @@ struct Win {
     icon: CursorIcon,
     /// Find bar query while the bar is open.
     find: Option<String>,
+    /// A short message in the corner ("saved ~/Desktop/…cast") and when it goes away.
+    flash: Option<(String, Instant)>,
 }
 
 const DEFAULT_PT: f32 = 14.0;
@@ -323,7 +347,15 @@ unset LT_ORIG_ZDOTDIR
 [[ -f "${ZDOTDIR:-$HOME}/.zshenv" ]] && source "${ZDOTDIR:-$HOME}/.zshenv"
 if [[ -o interactive ]]; then
   __lt_precmd() { printf '\e]133;D;%s\a\e]133;A\a\e]7;file://%s%s\a' "$?" "$HOST" "${PWD// /%20}"; }
-  __lt_preexec() { printf '\e]133;C\a'; }
+  __lt_preexec() {
+    # The command line, URL-encoded, so the terminal can name it when it finishes.
+    local LC_ALL=C s=${1[1,200]} o= c i
+    for (( i = 1; i <= $#s; i++ )); do
+      c=$s[i]
+      if [[ $c == [A-Za-z0-9._~/-] ]]; then o+=$c; else printf -v c '%%%02X' "'$c"; o+=$c; fi
+    done
+    printf '\e]133;C;cmdline_url=%s\a' "$o"
+  }
   autoload -Uz add-zsh-hook
   add-zsh-hook precmd __lt_precmd
   add-zsh-hook preexec __lt_preexec
@@ -413,8 +445,11 @@ fn spawn_reader(id: usize, mut pty: File, term: Arc<Mutex<Term>>, pending: Arc<A
             debug_log("out", &buf[..n]);
             let reply = {
                 let mut t = term.lock().unwrap();
-                let Term { grid, parser } = &mut *t;
+                let Term { grid, parser, recorder } = &mut *t;
                 parser.advance(grid, &buf[..n]);
+                if let Some(r) = recorder {
+                    r.output(&buf[..n]);
+                }
                 std::mem::take(&mut grid.reply)
             };
             if !reply.is_empty() {
@@ -627,7 +662,13 @@ impl Win {
                 let Some(pane) = tab.panes.iter().find(|p| p.id == *id) else { continue };
                 let (cols, rows) = r.grid_size(*rect);
                 debug_log("size", format!("pane {id}: {cols}x{rows}").as_bytes());
-                pane.term.lock().unwrap().grid.resize(cols, rows);
+                let mut t = pane.term.lock().unwrap();
+                let Term { grid, recorder, .. } = &mut *t;
+                if let Some(r) = recorder.as_mut().filter(|_| (cols, rows) != (grid.cols, grid.rows)) {
+                    r.resize(cols, rows);
+                }
+                grid.resize(cols, rows);
+                drop(t);
                 let ws = Winsize { ws_row: rows as u16, ws_col: cols as u16, ws_xpixel: rect.w as u16, ws_ypixel: rect.h as u16 };
                 let _ = unsafe { tiocswinsz(pane.master.as_raw_fd(), &ws) };
             }
@@ -662,13 +703,12 @@ impl Win {
         } else {
             Vec::new()
         };
-        let notice = self.update_notice();
-        let mut attention = false;
+        let notice = self.flash.as_ref().map(|f| f.0.clone()).or_else(|| self.update_notice());
+        let rec = format!("● rec · {} to stop", if cfg!(target_os = "macos") { "⌘⇧R" } else { "Ctrl+Shift+R" });
         let mut clip = None;
         for pane in self.tabs.iter().flat_map(|t| &t.panes) {
             pane.pending.store(false, Ordering::SeqCst);
             let mut t = pane.term.lock().unwrap();
-            attention |= std::mem::take(&mut t.grid.attention);
             clip = clip.or(t.grid.clip.take());
         }
         let (Some(win), Some(presenter), Some(r)) = (&self.window, &mut self.presenter, &mut self.renderer) else { return };
@@ -680,7 +720,7 @@ impl Win {
             let focused = *id == tab.active;
             let mut t = pane.term.lock().unwrap();
             let cursor_on = self.blink_on || !t.grid.cursor_blink;
-            let view = PaneView { rect: *rect, focused, cursor_on, find: if focused { self.find.as_deref() } else { None }, notice: if focused { notice.as_deref() } else { None } };
+            let view = PaneView { rect: *rect, focused, cursor_on, find: if focused { self.find.as_deref() } else { None }, notice: if t.recorder.is_some() { Some(&rec) } else if focused { notice.as_deref() } else { None } };
             r.draw_pane(&mut t.grid, &view);
             if focused {
                 title = t.grid.title.take();
@@ -697,9 +737,6 @@ impl Win {
         presenter.present(&r.fb, damage);
         if let Some(title) = title {
             win.set_title(&title);
-        }
-        if attention && !self.focused {
-            win.request_user_attention(Some(UserAttentionType::Informational));
         }
         if let Some(clip) = clip {
             clipboard_set(&clip);
@@ -729,7 +766,7 @@ impl Win {
             eprintln!("litty: failed to start a shell");
             return None;
         };
-        let term = Arc::new(Mutex::new(Term { grid: Grid::new(cols, rows), parser: Parser::new() }));
+        let term = Arc::new(Mutex::new(Term { grid: Grid::new(cols, rows), parser: Parser::new(), recorder: None }));
         let (pending, exited) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let id = NEXT_PANE.fetch_add(1, Ordering::Relaxed);
         spawn_reader(id, master.try_clone().ok()?, term.clone(), pending.clone(), exited.clone(), pid, self.proxy.clone());
@@ -1051,7 +1088,16 @@ impl Win {
         let shift = self.mods.shift_key();
         match key {
             "v" => self.paste(),
+            // Cmd+Shift+C: the last command's output, without its prompt.
+            "c" if shift && self.mods.super_key() => {
+                let term = self.term().clone();
+                if term.lock().unwrap().grid.select_last_output() {
+                    self.copy();
+                    self.redraw_soon();
+                }
+            }
             "c" => self.copy(),
+            "r" if shift => self.toggle_recording(),
             "k" => self.clear_screen(),
             "n" => self.new_window(),
             "u" if shift => {
@@ -1097,6 +1143,30 @@ impl Win {
             _ => return false,
         }
         true
+    }
+
+    /// Cmd+Shift+R: start or stop recording the focused pane as an asciinema cast.
+    fn toggle_recording(&mut self) {
+        let term = self.term().clone();
+        let mut t = term.lock().unwrap();
+        let message = match t.recorder.take() {
+            Some(r) => {
+                let path = r.finish();
+                let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+                Some(format!("saved ~/{}", path.strip_prefix(&home).unwrap_or(&path).display()))
+            }
+            None => match record::Recorder::start(t.grid.cols, t.grid.rows) {
+                Ok(r) => {
+                    t.recorder = Some(r);
+                    None
+                }
+                Err(e) => Some(format!("can't record: {e}")),
+            },
+        };
+        t.grid.dirty.fill(true);
+        drop(t);
+        self.flash = message.map(|m| (m, Instant::now() + Duration::from_secs(4)));
+        self.redraw_soon();
     }
 
     /// Text of the update notice: a short pill, or the prompt once opened.
@@ -1393,6 +1463,14 @@ impl Win {
                 Self::open_url(&url);
                 return;
             }
+            // On a prompt line: select that command's output.
+            let id = t.grid.abs_row(row);
+            if t.grid.select_output_from_prompt(id) {
+                drop(t);
+                self.selecting = false;
+                self.redraw_soon();
+                return;
+            }
         }
         if t.grid.mouse != 0 && !self.mods.shift_key() {
             let report = mouse_report(&t.grid, code, self.mods, col, row, !pressed);
@@ -1596,6 +1674,7 @@ impl Win {
             divider_drag: None,
             icon: CursorIcon::Default,
             find: None,
+            flash: None,
         };
         win.rebuild();
         win.new_tab(command, cwd);
@@ -1621,6 +1700,14 @@ impl Win {
     /// Blink the cursor, and return when this window next needs waking (a postponed frame or a blink).
     fn tick(&mut self, now: Instant) -> Option<Instant> {
         let mut deadline = self.frame_deadline;
+        if let Some((_, until)) = self.flash {
+            if now >= until {
+                self.flash = None;
+                self.notice_changed();
+            } else {
+                deadline = Some(deadline.map_or(until, |d| d.min(until)));
+            }
+        }
         let blinking = self.focused && !self.tabs.is_empty() && self.term().lock().unwrap().grid.cursor_blink;
         if blinking {
             if now >= self.next_blink {
@@ -1692,6 +1779,12 @@ struct App {
     tray_wanted: bool,
     #[cfg(target_os = "macos")]
     tray_at: Option<Instant>,
+    /// The hamster shows how a background command ended (true = exit 0) until this time.
+    #[cfg(target_os = "macos")]
+    tray_done: Option<(bool, Instant)>,
+    /// Made on the first notification (None inside: notifications are unavailable).
+    #[cfg(target_os = "macos")]
+    notifier: Option<Option<macos::Notifier>>,
     /// Update generation the tray menu shows.
     #[cfg(target_os = "macos")]
     tray_generation: Option<u64>,
@@ -1731,6 +1824,43 @@ impl App {
         }
     }
 
+    /// Slow commands that finished since the last look. With no litty window in front, the Dock
+    /// bounces, the hamster shows how it went and a notification says what finished.
+    fn take_finished(&mut self, now: Instant) {
+        let mut done = Vec::new();
+        for p in self.wins.values().flat_map(|w| w.tabs.iter().flat_map(|t| &t.panes)) {
+            // Never wait for a busy parser: the result stays in the grid until the next look.
+            if let Some(f) = p.term.try_lock().ok().and_then(|mut t| t.grid.finished.take()) {
+                done.push((p.id, f));
+            }
+        }
+        if done.is_empty() || self.wins.values().any(|w| w.focused) {
+            return;
+        }
+        for (pane, f) in done {
+            if let Some(win) = self.wins.values().find(|w| w.owns(pane)).and_then(|w| w.window.as_ref()) {
+                win.request_user_attention(Some(UserAttentionType::Informational));
+            }
+            let title = f.command.unwrap_or_else(|| "Command finished".into());
+            let body = match f.exit {
+                0 => format!("Done in {}", took_text(f.took)),
+                code => format!("Failed (exit {code}) after {}", took_text(f.took)),
+            };
+            #[cfg(target_os = "macos")]
+            {
+                self.tray_done = Some((f.exit == 0, now + Duration::from_secs(10)));
+                if let Some(n) = self.notifier.get_or_insert_with(macos::Notifier::new) {
+                    n.notify(pane, &title, &body);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (pane, now);
+                notify_send(&title, &body);
+            }
+        }
+    }
+
     /// Check for updates now, because the user asked.
     #[cfg(target_os = "macos")]
     fn check_update(&mut self) {
@@ -1754,9 +1884,11 @@ impl App {
         let since = panes.filter_map(|p| p.term.lock().unwrap().grid.running_since()).min();
         // Quick commands (ls, cd) don't make the hamster twitch.
         let running = since.map(|t| t + Duration::from_secs(1));
+        let done = self.tray_done.filter(|d| d.1 > now);
         let mode = match &ui.state {
             _ if ui.checking => TrayMode::Loading,
             update::State::Downloading(_) => TrayMode::Loading,
+            _ if done.is_some() => TrayMode::Done(done.is_some_and(|d| d.0)),
             _ if running.is_some_and(|t| t <= now) => TrayMode::Running,
             update::State::Available(_) | update::State::Staged(..) => TrayMode::Update,
             _ => TrayMode::Idle,
@@ -1786,7 +1918,7 @@ impl App {
         // With a litty window in front the terminal already shows what's going on: hold still.
         let still = mode == TrayMode::Running && self.wins.values().any(|w| w.focused);
         let next = tray.animate(mode, still, now);
-        next.into_iter().chain(running.filter(|&t| t > now)).min()
+        next.into_iter().chain(running.filter(|&t| t > now)).chain(done.map(|d| d.1)).min()
     }
 
     fn close_window(&mut self, id: WindowId) {
@@ -1816,6 +1948,8 @@ impl ApplicationHandler<Ev> for App {
         #[cfg(target_os = "macos")]
         {
             self.tray_wanted = config::get().tray;
+            let proxy = Mutex::new(self.proxy.clone());
+            macos::set_sink(Box::new(move |a| drop(proxy.lock().unwrap().send_event(Ev::Tray(a)))));
         }
     }
 
@@ -1834,13 +1968,13 @@ impl ApplicationHandler<Ev> for App {
     /// Sleep until the next thing that needs doing: a postponed frame or a cursor blink.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let now = Instant::now();
+        self.take_finished(now);
         let deadline = self.wins.values_mut().filter_map(|w| w.tick(now)).min();
         #[cfg(target_os = "macos")]
         let deadline = {
             if self.tray_at.is_some_and(|t| t <= now) {
                 self.tray_at = None;
-                let proxy = Mutex::new(self.proxy.clone());
-                self.tray = macos::Tray::new(Box::new(move |a| drop(proxy.lock().unwrap().send_event(Ev::Tray(a)))));
+                self.tray = macos::Tray::new();
             }
             deadline.into_iter().chain(self.sync_tray(now)).chain(self.tray_at).min()
         };
@@ -1889,6 +2023,14 @@ impl ApplicationHandler<Ev> for App {
                     macos::TrayAction::Check => self.check_update(),
                     macos::TrayAction::Install => install_update(&self.ui, &self.proxy),
                     macos::TrayAction::NewWindow => self.add_window(el, &[], None, None),
+                    macos::TrayAction::Focus(pane) => {
+                        if let Some(w) = self.wins.values_mut().find(|w| w.owns(pane)) {
+                            w.focus_pane(pane);
+                            if let Some(win) = &w.window {
+                                win.focus_window();
+                            }
+                        }
+                    }
                     macos::TrayAction::Quit => {
                         let ids: Vec<WindowId> = self.wins.keys().copied().collect();
                         for id in ids {
@@ -1968,6 +2110,10 @@ fn main() {
         tray_wanted: false,
         #[cfg(target_os = "macos")]
         tray_at: None,
+        #[cfg(target_os = "macos")]
+        tray_done: None,
+        #[cfg(target_os = "macos")]
+        notifier: None,
         #[cfg(target_os = "macos")]
         tray_generation: None,
     };

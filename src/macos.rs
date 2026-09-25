@@ -36,19 +36,27 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// What the user picked in the menu-bar menu.
+/// What the user picked in the menu-bar menu, or a clicked notification.
 #[derive(Clone, Copy, Debug)]
 pub enum TrayAction {
     Check,
     Install,
     NewWindow,
     Quit,
+    /// A "command finished" notification was clicked: show the pane with this id.
+    Focus(usize),
 }
 
+/// Menu items carry their action as a tag: the index in this list.
 const ACTIONS: [TrayAction; 4] = [TrayAction::Check, TrayAction::Install, TrayAction::NewWindow, TrayAction::Quit];
 
 type Sink = Box<dyn Fn(TrayAction) + Send + Sync>;
 static SINK: OnceLock<Sink> = OnceLock::new();
+
+/// Where menu picks and notification clicks go (the app's event loop). Set once at startup.
+pub fn set_sink(sink: Sink) {
+    let _ = SINK.set(sink);
+}
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -73,11 +81,15 @@ pub enum TrayMode {
     Update,
     Running,
     Loading,
+    /// A slow command just finished in the background: happy (exit 0) or dizzy.
+    Done(bool),
 }
 
 const TRAY_FRAME: Duration = Duration::from_millis(125);
 const IDLE: &[u8] = include_bytes!("../assets/tray/idle.png");
 const IDLE_UPDATE: &[u8] = include_bytes!("../assets/tray/idle-update.png");
+const DONE_OK: &[u8] = include_bytes!("../assets/tray/done-ok.png");
+const DONE_FAIL: &[u8] = include_bytes!("../assets/tray/done-fail.png");
 const RUN: [&[u8]; 8] = [
     include_bytes!("../assets/tray/run-0.png"),
     include_bytes!("../assets/tray/run-1.png"),
@@ -112,8 +124,7 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn new(sink: Sink) -> Option<Tray> {
-        let _ = SINK.set(sink);
+    pub fn new() -> Option<Tray> {
         // SAFETY: AppKit calls on the main thread (the event loop's), with valid receivers.
         unsafe {
             let bar: Retained<AnyObject> = msg_send![class!(NSStatusBar), systemStatusBar];
@@ -124,7 +135,7 @@ impl Tray {
             let _: () = msg_send![&*menu, setAutoenablesItems: false];
             let _: () = msg_send![&*item, setMenu: &*menu];
             let target: Retained<Target> = msg_send![Target::class(), new];
-            Some(Tray { _item: item, button: button?, menu, target, images: vec![None; 2 + RUN.len() + LOAD.len()], mode: None, frame: 0, next: Instant::now() })
+            Some(Tray { _item: item, button: button?, menu, target, images: vec![None; 4 + RUN.len() + LOAD.len()], mode: None, frame: 0, next: Instant::now() })
         }
     }
 
@@ -133,8 +144,10 @@ impl Tray {
             let png = match index {
                 0 => IDLE,
                 1 => IDLE_UPDATE,
-                i if i < 2 + RUN.len() => RUN[i - 2],
-                i => LOAD[i - 2 - RUN.len()],
+                2 => DONE_OK,
+                3 => DONE_FAIL,
+                i if i < 4 + RUN.len() => RUN[i - 4],
+                i => LOAD[i - 4 - RUN.len()],
             };
             // SAFETY: NSData copies the bytes; NSImage decodes the PNG lazily.
             self.images[index] = unsafe {
@@ -155,7 +168,7 @@ impl Tray {
     /// AppKit a few ms of snapshotting, hence animating only when it is worth looking at.
     pub fn animate(&mut self, mode: TrayMode, still: bool, now: Instant) -> Option<Instant> {
         let frames = match mode {
-            TrayMode::Idle | TrayMode::Update => 1,
+            TrayMode::Idle | TrayMode::Update | TrayMode::Done(_) => 1,
             _ if still => 1,
             TrayMode::Running => RUN.len(),
             TrayMode::Loading => LOAD.len(),
@@ -170,8 +183,10 @@ impl Tray {
         let index = match mode {
             TrayMode::Idle => 0,
             TrayMode::Update => 1,
-            TrayMode::Running => 2 + self.frame,
-            TrayMode::Loading => 2 + RUN.len() + self.frame,
+            TrayMode::Done(true) => 2,
+            TrayMode::Done(false) => 3,
+            TrayMode::Running => 4 + self.frame,
+            TrayMode::Loading => 4 + RUN.len() + self.frame,
         };
         if let Some(image) = self.image(index) {
             // SAFETY: main thread, valid button and image.
@@ -191,7 +206,8 @@ impl Tray {
                 let item: Retained<AnyObject> = msg_send![msg_send![class!(NSMenuItem), alloc], initWithTitle: &*NSString::from_str(title), action: sel, keyEquivalent: &*NSString::from_str(key)];
                 if let Some(a) = action {
                     let _: () = msg_send![&*item, setTarget: &*self.target];
-                    let _: () = msg_send![&*item, setTag: a as isize];
+                    let tag = ACTIONS.iter().position(|b| std::mem::discriminant(b) == std::mem::discriminant(&a)).unwrap_or(0);
+                    let _: () = msg_send![&*item, setTag: tag as isize];
                 } else {
                     let _: () = msg_send![&*item, setEnabled: false];
                 }
@@ -205,6 +221,98 @@ impl Tray {
             let _: () = msg_send![&*self.menu, addItem: &*sep];
             add("New Window", Some(TrayAction::NewWindow), "");
             add("Quit litty", Some(TrayAction::Quit), "");
+        }
+    }
+}
+
+// "Command finished" notifications through UserNotifications. The framework is loaded on first
+// use (not linked), so startup doesn't pay for it; it needs an app bundle, so a bare binary
+// (cargo run) silently skips notifications.
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "LittyNotificationDelegate"]
+    struct NotificationDelegate;
+
+    impl NotificationDelegate {
+        #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+        fn did_receive(&self, _center: &AnyObject, response: &AnyObject, done: &block2::Block<dyn Fn()>) {
+            // SAFETY: documented UNNotificationResponse → UNNotification → UNNotificationRequest chain.
+            let id: Option<Retained<NSString>> = unsafe {
+                let note: Retained<AnyObject> = msg_send![response, notification];
+                let request: Retained<AnyObject> = msg_send![&*note, request];
+                msg_send![&*request, identifier]
+            };
+            let pane = id.and_then(|s| s.to_string().strip_prefix("litty-pane-")?.split('-').next()?.parse().ok());
+            if let (Some(sink), Some(pane)) = (SINK.get(), pane) {
+                sink(TrayAction::Focus(pane));
+            }
+            done.call(());
+        }
+
+        // Also show the banner if litty happens to be the active app.
+        #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
+        fn will_present(&self, _center: &AnyObject, _note: &AnyObject, done: &block2::Block<dyn Fn(usize)>) {
+            // UNNotificationPresentationOptionList | Banner
+            done.call((8 | 16,));
+        }
+    }
+);
+
+pub struct Notifier {
+    center: Retained<AnyObject>,
+    _delegate: Retained<NotificationDelegate>,
+    sent: u64,
+}
+
+impl Notifier {
+    pub fn new() -> Option<Notifier> {
+        // SAFETY: main thread; the class exists once the framework is loaded, and
+        // currentNotificationCenter is only called inside an app bundle (it throws otherwise).
+        unsafe {
+            let bundle: Retained<AnyObject> = msg_send![class!(NSBundle), mainBundle];
+            let id: Option<Retained<NSString>> = msg_send![&*bundle, bundleIdentifier];
+            id?;
+            let path = c"/System/Library/Frameworks/UserNotifications.framework/UserNotifications";
+            if nix::libc::dlopen(path.as_ptr(), nix::libc::RTLD_LAZY).is_null() {
+                return None;
+            }
+            let class = objc2::runtime::AnyClass::get(c"UNUserNotificationCenter")?;
+            let center: Retained<AnyObject> = msg_send![class, currentNotificationCenter];
+            let delegate: Retained<NotificationDelegate> = msg_send![NotificationDelegate::class(), new];
+            let _: () = msg_send![&*center, setDelegate: &*delegate];
+            Some(Notifier { center, _delegate: delegate, sent: 0 })
+        }
+    }
+
+    /// Post a notification that opens the pane `pane` when clicked. The first one asks the user
+    /// for permission; after that the system remembers the answer.
+    pub fn notify(&mut self, pane: usize, title: &str, body: &str) {
+        self.sent += 1;
+        let (title, body) = (title.to_string(), body.to_string());
+        let id = format!("litty-pane-{pane}-{}", self.sent);
+        let post = block2::RcBlock::new(move |granted: objc2::runtime::Bool, _err: *mut AnyObject| {
+            if !granted.as_bool() {
+                return;
+            }
+            // SAFETY: UserNotifications is thread-safe; this runs on its private queue.
+            unsafe {
+                let Some(class) = objc2::runtime::AnyClass::get(c"UNUserNotificationCenter") else { return };
+                let center: Retained<AnyObject> = msg_send![class, currentNotificationCenter];
+                let Some(content_class) = objc2::runtime::AnyClass::get(c"UNMutableNotificationContent") else { return };
+                let content: Retained<AnyObject> = msg_send![content_class, new];
+                let _: () = msg_send![&*content, setTitle: &*NSString::from_str(&title)];
+                let _: () = msg_send![&*content, setBody: &*NSString::from_str(&body)];
+                let Some(request_class) = objc2::runtime::AnyClass::get(c"UNNotificationRequest") else { return };
+                let none: *const AnyObject = std::ptr::null();
+                let request: Retained<AnyObject> = msg_send![request_class, requestWithIdentifier: &*NSString::from_str(&id), content: &*content, trigger: none];
+                let no_handler: Option<&block2::Block<dyn Fn(*mut AnyObject)>> = None;
+                let _: () = msg_send![&*center, addNotificationRequest: &*request, withCompletionHandler: no_handler];
+            }
+        });
+        // SAFETY: main thread, valid center; UNAuthorizationOptionAlert (4).
+        unsafe {
+            let _: () = msg_send![&*self.center, requestAuthorizationWithOptions: 4usize, completionHandler: &*post];
         }
     }
 }

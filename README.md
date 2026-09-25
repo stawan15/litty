@@ -70,7 +70,17 @@ quit. When nothing is happening it stays still and costs no CPU.
 
 - **Command blocks.** With zsh (auto-enabled) or any shell that emits OSC 133, failed commands
   get a faint red tint on their output, and slow or failing commands show `exit N  1.2s` at the
-  end of the command line. Cmd+Up / Cmd+Down jump between prompts.
+  end of the command line. Cmd+Up / Cmd+Down jump between prompts. Cmd+Shift+C copies the last
+  command's output (without the prompt); Cmd-click a prompt to select that command's output.
+- **Done notifications.** When a command that ran 8 s or longer finishes while litty is in the
+  background, the Dock icon bounces, the menu-bar hamster cheers (exit 0) or looks dizzy (failure),
+  and a notification says what finished and how long it took ("cargo build — Done in 2m13s").
+  Clicking it brings you to that tab. On Linux the notification goes through `notify-send`.
+- **Thai word selection.** Thai is written without spaces, so double-clicking Thai text picks the
+  dictionary word under the pointer instead of the whole line (maximal matching over PyThaiNLP's
+  CC0 word list, loaded on first use).
+- **Recordings.** Cmd+Shift+R (Ctrl+Shift+R on Linux) records the pane as an asciinema cast on
+  your Desktop; press it again to stop. Play it with `asciinema play` or embed it on a web page.
 - **Tabs and splits.** Cmd+T opens a tab in the current directory. On macOS tabs are native window
   tabs (real NSWindows in one tab group: drag to detach, Mission Control, the system tab bar); on
   Linux litty draws its own tab bar. Cmd+D splits right, Cmd+Shift+D splits down; drag a divider to resize; inactive
@@ -83,8 +93,6 @@ quit. When nothing is happening it stays still and costs no CPU.
   matches appear as ticks. Click or drag it to jump.
 - **Find** (Cmd+F): highlights every match, Enter / Shift+Enter to step, Esc to close.
 - **Links:** hold Cmd (Ctrl on Linux) and click a URL.
-- **Attention:** the Dock icon bounces when a command that ran 8 s or longer finishes in the
-  background.
 - **Maple Mono NF** (rounded, with Nerd Font icons and powerline glyphs) is used automatically when installed in `~/Library/Fonts`, `~/.local/share/fonts` or `~/.fonts` (files `MapleMono-NF-{Regular,Bold,Italic,BoldItalic}.ttf`, SIL OFL); otherwise Menlo / DejaVu Sans Mono.
 - Correct Thai (tone marks and vowels stack on the base letter), procedural box drawing,
   bold/italic/underline, truecolor, 20k lines of compact scrollback.
@@ -102,6 +110,8 @@ quit. When nothing is happening it stays still and costs no CPU.
 | Cmd+Option+arrows | Focus the pane in that direction |
 | Cmd+Ctrl+arrows / Cmd+Ctrl+= | Move the split / equalize splits |
 | Cmd+Shift+Enter | Zoom the focused pane |
+| Cmd+Shift+C | Copy the last command's output |
+| Cmd+Shift+R | Start / stop recording the pane (asciinema) |
 | Cmd+K | Clear screen and scrollback |
 | Cmd+N | New window |
 | Cmd+F | Find |

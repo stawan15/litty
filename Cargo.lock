@@ -675,6 +675,7 @@ name = "litty-term"
 version = "0.5.0"
 dependencies = [
  "ab_glyph",
+ "block2 0.6.2",
  "ed25519-compact",
  "nix",
  "objc2 0.6.4",
