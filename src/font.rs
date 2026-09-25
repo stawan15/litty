@@ -97,7 +97,7 @@ pub struct Glyph {
 
 /// Font file contents, read once per path and kept for the process lifetime so faces can borrow
 /// them ('static) and zooming (which rebuilds `Fonts`) never re-reads or duplicates a file.
-fn font_data(path: &str) -> Option<&'static [u8]> {
+pub(crate) fn font_data(path: &str) -> Option<&'static [u8]> {
     static CACHE: OnceLock<Mutex<HashMap<String, &'static [u8]>>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
     if let Some(d) = cache.get(path) {
@@ -181,6 +181,7 @@ pub struct Fonts {
     by_id: HashMap<(u16, u8), Glyph>,
     /// Whether runs of symbols are shaped so the font's ligatures apply (Maple Mono).
     pub ligatures: bool,
+    pub emoji: crate::emoji::Emoji,
     pub cell_w: usize,
     pub cell_h: usize,
     pub ascent: i32,
@@ -208,6 +209,7 @@ impl Fonts {
             other: HashMap::new(),
             by_id: HashMap::new(),
             ligatures: user_family().is_some_and(|u| std::ptr::eq(u, family)),
+            emoji: Default::default(),
         }
     }
 

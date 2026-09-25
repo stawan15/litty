@@ -149,6 +149,10 @@ pub struct Grid {
     pub drawn_scroll: usize,
     pub app_cursor: bool,
     pub bracketed_paste: bool,
+    /// Mode 1004: report focus in/out to the application.
+    pub focus_events: bool,
+    /// Mode 2026: when the application began a synchronized update (the renderer holds the frame).
+    pub sync_since: Option<std::time::Instant>,
     /// Bytes the terminal must answer back to the application (DSR, DA).
     pub reply: Vec<u8>,
     /// Pending window title from OSC 0/2, taken by the renderer.
@@ -193,6 +197,13 @@ pub struct Grid {
 }
 
 impl Grid {
+    /// Answer a colour query: `OSC <what>;rgb:RRRR/GGGG/BBBB`, ended like the request was.
+    fn osc_color_reply(&mut self, what: &str, color: u32, bell: bool) {
+        let (r, g, b) = ((color >> 16) & 255, (color >> 8) & 255, color & 255);
+        let end = if bell { "\x07" } else { "\x1b\\" };
+        self.reply.extend(format!("\x1b]{what};rgb:{:04x}/{:04x}/{:04x}{end}", r * 257, g * 257, b * 257).bytes());
+    }
+
     pub fn new(cols: usize, rows: usize) -> Self {
         let blank = Cell::blank(DEF_FG, DEF_BG);
         Grid {
@@ -209,6 +220,8 @@ impl Grid {
             drawn_scroll: 0,
             app_cursor: false,
             bracketed_paste: false,
+            focus_events: false,
+            sync_since: None,
             reply: Vec::new(),
             title: None,
             win_title: String::new(),
@@ -840,6 +853,8 @@ impl Grid {
                 1006 => self.mouse_sgr = on,
                 47 | 1047 | 1049 => self.set_alt(on),
                 2004 => self.bracketed_paste = on,
+                1004 => self.focus_events = on,
+                2026 => self.sync_since = on.then(std::time::Instant::now),
                 _ => {}
             }
         }
@@ -970,8 +985,20 @@ impl Perform for Grid {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell: bool) {
         match params {
+            // Colour queries (neovim, bat, delta ask for the background to pick a theme).
+            [code @ (b"10" | b"11" | b"12"), b"?", ..] => {
+                let color = if *code == b"11" { DEF_BG } else { DEF_FG };
+                self.osc_color_reply(&String::from_utf8_lossy(code), color, bell);
+            }
+            [b"4", rest @ ..] => {
+                for pair in rest.chunks_exact(2) {
+                    if let (Some(n), b"?") = (std::str::from_utf8(pair[0]).ok().and_then(|n| n.parse::<u8>().ok()), pair[1]) {
+                        self.osc_color_reply(&format!("4;{n}"), xterm256(n), bell);
+                    }
+                }
+            }
             [b"0" | b"2", title, ..] => {
                 let title = String::from_utf8_lossy(title).into_owned();
                 if !self.icon_title_seen {
@@ -1026,6 +1053,25 @@ impl Perform for Grid {
                     _ => CursorShape::Block,
                 };
                 self.cursor_blink = matches!(style, 1 | 3 | 5);
+            }
+            // DECRQM: applications ask whether a mode is supported before relying on it.
+            ([b'?', b'$'], 'p') => {
+                let mode = raw(params, 0);
+                let state = match mode {
+                    1 => Some(self.app_cursor),
+                    25 => Some(self.cursor_visible),
+                    1000 => Some(self.mouse == 1),
+                    1002 => Some(self.mouse == 2),
+                    1003 => Some(self.mouse == 3),
+                    1004 => Some(self.focus_events),
+                    1006 => Some(self.mouse_sgr),
+                    47 | 1047 | 1049 => Some(self.in_alt),
+                    2004 => Some(self.bracketed_paste),
+                    2026 => Some(self.sync_since.is_some()),
+                    _ => None,
+                };
+                let code = state.map_or(0, |on| if on { 1 } else { 2 });
+                self.reply.extend(format!("\x1b[?{mode};{code}$y").bytes());
             }
             ([b'?'], 'h') => self.set_mode(params, true),
             ([b'?'], 'l') => self.set_mode(params, false),
@@ -1113,6 +1159,10 @@ impl Perform for Grid {
             ([], 'm') => self.sgr(params),
             ([], 's') => self.saved = (self.cx, self.cy),
             ([], 'u') => (self.cx, self.cy) = self.saved,
+            // DSR 5: "are you there?" (used as a sentinel after other queries).
+            ([], 'n') if raw(params, 0) == 5 => self.reply.extend(b"\x1b[0n"),
+            // Kitty keyboard protocol query: supported, no enhancements active.
+            ([b'?'], 'u') => self.reply.extend(b"\x1b[?0u"),
             ([], 'n') if raw(params, 0) == 6 => {
                 self.reply.extend(format!("\x1b[{};{}R", self.cy + 1, self.cx + 1).bytes());
             }
@@ -1499,5 +1549,46 @@ mod tests {
         let mut g = Grid::new(5, 3);
         feed(&mut g, "abcde\x1b[Cf");
         assert_eq!((line(&g, 0), line(&g, 1)), ("abcdf".to_string(), String::new()));
+    }
+
+    #[test]
+    fn mode_queries_and_focus_and_sync_modes() {
+        let mut g = Grid::new(10, 3);
+        feed(&mut g, "\x1b[?1004h\x1b[?2026h");
+        assert!(g.focus_events && g.sync_since.is_some());
+        feed(&mut g, "\x1b[?2026$p\x1b[?1004$p\x1b[?9999$p");
+        assert_eq!(g.reply, b"\x1b[?2026;1$y\x1b[?1004;1$y\x1b[?9999;0$y");
+        feed(&mut g, "\x1b[?2026l\x1b[?1004l");
+        assert!(!g.focus_events && g.sync_since.is_none());
+    }
+
+    /// Developer tool: `CAP=file COLS=80 cargo test replay_capture -- --ignored --nocapture` feeds
+    /// bytes recorded from a real program (or `LITTY_LOG`) through the grid and prints the screen.
+    #[test]
+    #[ignore]
+    fn replay_capture() {
+        let bytes = std::fs::read(std::env::var("CAP").unwrap()).unwrap();
+        let cols = std::env::var("COLS").ok().and_then(|c| c.parse().ok()).unwrap_or(80);
+        let mut g = Grid::new(cols, 24);
+        Parser::new().advance(&mut g, &bytes);
+        for y in 0..g.rows {
+            eprintln!("{y:2}|{}", g.row(y).iter().map(|c| c.ch).collect::<String>().trim_end());
+        }
+        eprintln!("cursor {} {}", g.cx, g.cy);
+    }
+
+    #[test]
+    fn colour_queries_are_answered() {
+        let mut g = Grid::new(10, 3);
+        feed(&mut g, "\x1b]11;?\x07\x1b]10;?\x1b\\\x1b]4;1;?\x07");
+        let reply = String::from_utf8(g.reply.clone()).unwrap();
+        assert!(reply.starts_with("\x1b]11;rgb:1a1a/1b1b/2626\x07\x1b]10;rgb:c0c0/caca/f5f5\x1b\\\x1b]4;1;rgb:"), "{reply:?}");
+    }
+
+    #[test]
+    fn status_report_and_keyboard_protocol_queries() {
+        let mut g = Grid::new(10, 3);
+        feed(&mut g, "\x1b[5n\x1b[?u");
+        assert_eq!(g.reply, b"\x1b[0n\x1b[?0u");
     }
 }

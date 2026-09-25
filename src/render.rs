@@ -1,3 +1,4 @@
+use unicode_width::UnicodeWidthChar;
 use crate::font::{Fonts, Glyph};
 use crate::grid::{ANSI, BOLD, Cell, CursorShape, DEF_BG, Grid, ITALIC, Mark, UNDERLINE};
 
@@ -99,6 +100,27 @@ fn blend_glyph(fb: &mut [u32], w: usize, clip: [usize; 4], g: &Glyph, ox: usize,
                 let mix = |s: u32, d: u32| (s * a + d * (255 - a)) / 255;
                 (mix(fr, (*dst >> 16) & 255) << 16) | (mix(fgc, (*dst >> 8) & 255) << 8) | mix(fb_, *dst & 255)
             };
+        }
+    }
+}
+
+/// Blend a straight-alpha RGBA bitmap into the framebuffer at (ox, oy), inside `clip`.
+fn blend_rgba(fb: &mut [u32], w: usize, clip: [usize; 4], bmp: &crate::emoji::Bitmap, ox: usize, oy: usize) {
+    let [cx0, cy0, cx1, cy1] = clip;
+    for row in 0..bmp.side {
+        let py = oy + row;
+        if py < cy0 || py >= cy1 {
+            continue;
+        }
+        for col in 0..bmp.side {
+            let px = ox + col;
+            let p = &bmp.rgba[(row * bmp.side + col) * 4..][..4];
+            if p[3] == 0 || px < cx0 || px >= cx1 {
+                continue;
+            }
+            let (a, dst) = (p[3] as u32, &mut fb[py * w + px]);
+            let mix = |s: u8, d: u32| (s as u32 * a + d * (255 - a)) / 255;
+            *dst = (mix(p[0], (*dst >> 16) & 255) << 16) | (mix(p[1], (*dst >> 8) & 255) << 8) | mix(p[2], *dst & 255);
         }
     }
 }
@@ -308,6 +330,8 @@ impl Renderer {
             let style = c.attrs & (BOLD | ITALIC);
             if self.draw_special(c.ch, ox + x * cw, oy, cw, ch, fg, bg) {
                 // Box and block characters are drawn to fit the cell.
+            } else if c.ch as u32 >= 0x231A && UnicodeWidthChar::width(c.ch) == Some(2) && self.draw_emoji(c.ch, ox + x * cw, oy) {
+                // A colour emoji bitmap.
             } else if let Some(&id) = ligatures.get(x).and_then(Option::as_ref) {
                 self.glyph_id(id, style, ox + x * cw, oy, fg);
             } else if c.ch != ' ' && c.ch != '\0' {
@@ -459,6 +483,17 @@ impl Renderer {
         self.text(&label, bx + 4 * u, by + 2 * u, 0xc0caf5);
     }
 
+    /// Draw `ch` as a colour emoji in the two cells at (x, y); false if the emoji font lacks it.
+    fn draw_emoji(&mut self, ch: char, x: usize, y: usize) -> bool {
+        let (cw, ch_px) = (self.fonts.cell_w, self.fonts.cell_h);
+        let side = (2 * cw).min(ch_px);
+        let Some(bmp) = self.fonts.emoji.bitmap(ch, side) else { return false };
+        let (ex, ey) = (x + (2 * cw - side) / 2, y + (ch_px - side) / 2);
+        blend_rgba(&mut self.fb, self.w, self.clip, bmp, ex, ey);
+        self.mark(ey, ey + side);
+        true
+    }
+
     fn draw_notice(&mut self, text: &str, rect: Rect) {
         let (u, cw, ch) = (self.unit(), self.fonts.cell_w, self.fonts.cell_h);
         let fit = rect.w.saturating_sub(14 * u) / cw;
@@ -562,5 +597,28 @@ mod tests {
     fn a_shorter_notice_leaves_nothing_of_the_longer_one() {
         let long = "0.3.2 · Enter: update on quit · Esc: skip";
         assert!(frame(&[long, "downloading 0.3.2…"]) == frame(&["downloading 0.3.2…"]));
+    }
+
+    #[test]
+    fn colour_emoji_are_drawn_in_colour() {
+        if !std::path::Path::new("/System/Library/Fonts/Apple Color Emoji.ttc").exists() {
+            return; // only macOS ships the font at this path
+        }
+        let mut r = Renderer::new(28.0, 20);
+        r.resize(400, 200);
+        let rect = r.area();
+        let (cols, rows) = r.grid_size(rect);
+        let mut g = Grid::new(cols, rows);
+        let mut p = vte::Parser::new();
+        p.advance(&mut g, "a😀b🎉c".as_bytes());
+        r.draw_pane(&mut g, &PaneView { rect, focused: true, cursor_on: false, find: None, notice: None });
+        // The default palette is blue-ish grey, so a strongly yellow/red pixel can only be emoji.
+        let coloured = r.fb.iter().filter(|&&px| ((px >> 16) & 255) as i32 - (px & 255) as i32 > 100).count();
+        assert!(coloured > 100, "only {coloured} coloured pixels");
+        if let Ok(path) = std::env::var("DUMP_PPM") {
+            let mut out = format!("P6\n{} {}\n255\n", r.w, r.h).into_bytes();
+            out.extend(r.fb.iter().flat_map(|&px| [(px >> 16) as u8, (px >> 8) as u8, px as u8]));
+            std::fs::write(path, out).unwrap();
+        }
     }
 }

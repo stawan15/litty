@@ -1,4 +1,5 @@
 mod boxdraw;
+mod emoji;
 mod font;
 mod grid;
 #[cfg(target_os = "macos")]
@@ -272,6 +273,8 @@ const PAD_PT: f32 = 10.0;
 const FRAME: Duration = Duration::from_millis(15);
 const BLINK: Duration = Duration::from_millis(530);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// Longest a synchronized update (mode 2026) may hold the screen back if the program never ends it.
+const SYNC_MAX: Duration = Duration::from_millis(150);
 
 /// Makes zsh report prompt and command boundaries (OSC 133) so the terminal can draw command
 /// blocks. The temporary ZDOTDIR only holds a .zshenv that restores the user's own ZDOTDIR and
@@ -745,12 +748,18 @@ impl Win {
             return;
         }
         self.reset_interaction();
+        if self.focused {
+            self.report_focus(false);
+        }
         // The old focused pane is dimmed and the new one lit up: both need repainting.
         for p in &self.tab().panes {
             p.term.lock().unwrap().grid.dirty.fill(true);
         }
         let tab = &mut self.tabs[self.active];
         tab.active = id;
+        if self.focused {
+            self.report_focus(true);
+        }
         let title = self.term().lock().unwrap().grid.win_title.clone();
         if let Some(w) = &self.window {
             w.set_title(if title.is_empty() { "litty" } else { &title });
@@ -1566,6 +1575,18 @@ impl Win {
         win
     }
 
+    /// A program in the visible tab is inside a synchronized update: hold the frame, but not for long.
+    fn sync_holds(&self) -> bool {
+        self.tab().panes.iter().any(|p| p.term.lock().unwrap().grid.sync_since.is_some_and(|t| t.elapsed() < SYNC_MAX))
+    }
+
+    /// Tell the focused pane's program (mode 1004) that the window gained or lost focus.
+    fn report_focus(&mut self, focused: bool) {
+        if self.term().lock().unwrap().grid.focus_events {
+            self.send(if focused { b"\x1b[I" } else { b"\x1b[O" });
+        }
+    }
+
     fn owns(&self, pane: usize) -> bool {
         self.tabs.iter().any(|t| t.panes.iter().any(|p| p.id == pane))
     }
@@ -1597,6 +1618,8 @@ impl Win {
             WindowEvent::RedrawRequested if !self.tabs.is_empty() => {
                 if Instant::now() < self.next_frame {
                     self.frame_deadline = Some(self.next_frame);
+                } else if self.sync_holds() {
+                    self.frame_deadline = Some(Instant::now() + Duration::from_millis(10));
                 } else {
                     self.frame_deadline = None;
                     // Paced from the start of the frame, so drawing time doesn't stretch the interval.
@@ -1608,6 +1631,7 @@ impl Win {
             WindowEvent::Focused(f) => {
                 self.focused = f;
                 if !self.tabs.is_empty() {
+                    self.report_focus(f);
                     // Redraw the cursor as solid or hollow.
                     for p in &self.tab().panes {
                         p.term.lock().unwrap().grid.dirty.fill(true);
