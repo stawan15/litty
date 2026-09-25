@@ -356,16 +356,27 @@ fn spawn_reader(id: usize, mut pty: File, term: Arc<Mutex<Term>>, pending: Arc<A
     });
 }
 
+/// pbcopy/pbpaste convert text with the locale's encoding, and an app launched from Finder or the
+/// Dock has no locale: without this, pasted and copied Thai text turns into `?` and mojibake.
+fn clipboard_command(cmd: &str, args: &[&str]) -> Command {
+    let mut c = Command::new(cmd);
+    c.args(args);
+    if ["LANG", "LC_ALL", "LC_CTYPE"].iter().all(|k| std::env::var_os(k).is_none()) {
+        c.env("LANG", "en_US.UTF-8");
+    }
+    c
+}
+
 fn clipboard() -> Option<Vec<u8>> {
     [("pbpaste", &[][..]), ("wl-paste", &["-n"]), ("xclip", &["-o", "-selection", "clipboard"])]
         .iter()
-        .find_map(|(cmd, args)| Command::new(cmd).args(*args).output().ok().filter(|o| o.status.success()))
+        .find_map(|(cmd, args)| clipboard_command(cmd, args).output().ok().filter(|o| o.status.success()))
         .map(|o| o.stdout)
 }
 
 fn clipboard_set(text: &[u8]) {
     for (cmd, args) in [("pbcopy", &[][..]), ("wl-copy", &[]), ("xclip", &["-selection", "clipboard", "-i"])] {
-        let child = Command::new(cmd).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        let child = clipboard_command(cmd, args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
         if let Ok(mut c) = child {
             if let Some(mut stdin) = c.stdin.take() {
                 let _ = stdin.write_all(text);

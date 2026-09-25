@@ -74,19 +74,20 @@ pub enum TabHit {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn blend_glyph(fb: &mut [u32], w: usize, h: usize, g: &Glyph, ox: usize, oy: usize, ascent: i32, fg: u32) {
+fn blend_glyph(fb: &mut [u32], w: usize, clip: [usize; 4], g: &Glyph, ox: usize, oy: usize, ascent: i32, fg: u32) {
+    let [cx0, cy0, cx1, cy1] = clip.map(|v| v as i32);
     let gx = ox as i32 + g.m.xmin;
     let gy = oy as i32 + ascent - g.m.ymin - g.m.height as i32;
     let (fr, fgc, fb_) = ((fg >> 16) & 255, (fg >> 8) & 255, fg & 255);
     for row in 0..g.m.height {
         let py = gy + row as i32;
-        if py < 0 || py >= h as i32 {
+        if py < cy0 || py >= cy1 {
             continue;
         }
         for col in 0..g.m.width {
             let px = gx + col as i32;
             let a = g.bmp[row * g.m.width + col] as u32;
-            if a == 0 || px < 0 || px >= w as i32 {
+            if a == 0 || px < cx0 || px >= cx1 {
                 continue;
             }
             let dst = &mut fb[py as usize * w + px as usize];
@@ -126,6 +127,9 @@ pub struct Renderer {
     tmp: Vec<Cell>,
     /// Rows (first, last + 1) whose pixels changed since the last `take_damage`.
     damage: Option<(usize, usize)>,
+    /// Glyphs are only drawn inside this (x0, y0, x1, y1): one that overhangs its cell would leave
+    /// pixels behind that no later repaint of the row erases.
+    clip: [usize; 4],
 }
 
 impl Renderer {
@@ -139,6 +143,7 @@ impl Renderer {
             bar_h: 0,
             tmp: Vec::new(),
             damage: None,
+            clip: [0; 4],
         }
     }
 
@@ -152,6 +157,7 @@ impl Renderer {
         self.h = h;
         self.fb = vec![DEF_BG; w * h];
         self.damage = Some((0, h));
+        self.clip = [0, 0, w, h];
     }
 
     /// The area panes are laid out in: the window minus padding and the tab bar.
@@ -244,6 +250,7 @@ impl Renderer {
     fn draw_row(&mut self, g: &Grid, y: usize, view: &PaneView) {
         let (cw, ch) = (self.fonts.cell_w, self.fonts.cell_h);
         let (ox, oy) = (view.rect.x, view.rect.y + y * ch);
+        self.clip = [ox, oy, (ox + g.cols * cw).min(self.w), (oy + ch).min(self.h)];
         let id = g.abs_row(y);
         let cursor_row = g.cursor_visible && g.scroll == 0 && y == g.cy;
         // Only the block cursor recolours its cell; other shapes are drawn over the text.
@@ -340,6 +347,7 @@ impl Renderer {
             }
         }
         self.tmp = tmp;
+        self.clip = [0, 0, self.w, self.h];
     }
 
     /// Right rail: scroll position over the whole history, with ticks for failed commands
@@ -501,8 +509,8 @@ impl Renderer {
         let ascent = self.fonts.ascent;
         let g = self.fonts.glyph(ch, style);
         let (y0, h) = (oy as i32 + ascent - g.m.ymin - g.m.height as i32, g.m.height);
-        blend_glyph(&mut self.fb, self.w, self.h, g, ox, oy, ascent, fg);
-        self.mark(y0.max(0) as usize, (y0 + h as i32).max(0) as usize);
+        blend_glyph(&mut self.fb, self.w, self.clip, g, ox, oy, ascent, fg);
+        self.mark((y0.max(0) as usize).max(self.clip[1]), ((y0 + h as i32).max(0) as usize).min(self.clip[3]));
     }
 
     /// Draw a glyph chosen by id (from a shaped run) instead of by character.
@@ -510,7 +518,7 @@ impl Renderer {
         let ascent = self.fonts.ascent;
         let g = self.fonts.glyph_by_id(id, style);
         let (y0, h) = (oy as i32 + ascent - g.m.ymin - g.m.height as i32, g.m.height);
-        blend_glyph(&mut self.fb, self.w, self.h, g, ox, oy, ascent, fg);
-        self.mark(y0.max(0) as usize, (y0 + h as i32).max(0) as usize);
+        blend_glyph(&mut self.fb, self.w, self.clip, g, ox, oy, ascent, fg);
+        self.mark((y0.max(0) as usize).max(self.clip[1]), ((y0 + h as i32).max(0) as usize).min(self.clip[3]));
     }
 }
