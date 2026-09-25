@@ -1010,7 +1010,11 @@ impl Perform for Grid {
 
     fn csi_dispatch(&mut self, params: &Params, inter: &[u8], _: bool, action: char) {
         let (cols, rows) = (self.cols, self.rows);
-        self.cx = self.cx.min(cols - 1);
+        // A cursor past the last column is a pending wrap; only sequences that act on the cursor
+        // position cancel it (zsh sets colours between the last column and the space that wraps).
+        if !matches!(action, 'm' | 'h' | 'l' | 'q') {
+            self.cx = self.cx.min(cols - 1);
+        }
         let n = param(params, 0, 1);
         match (inter, action) {
             ([b' '], 'q') => {
@@ -1483,5 +1487,17 @@ mod tests {
         feed(&mut g, "a\r\nb\r\nc\r\nd");
         g.clear_all();
         assert_eq!((g.history_len(), line(&g, 0), line(&g, 1), g.cy, g.cx), (0, "".into(), "".into(), 0, 0));
+    }
+
+    #[test]
+    fn colour_change_keeps_the_pending_wrap() {
+        // zsh writes the last column, resets colours, then a space and CR to force the wrap.
+        let mut g = Grid::new(5, 3);
+        feed(&mut g, "abcd\x1b[31me\x1b[0m\x1b[39m \r");
+        assert_eq!((line(&g, 0), g.cx, g.cy), ("abcde".to_string(), 0, 1));
+        // A cursor movement does cancel it.
+        let mut g = Grid::new(5, 3);
+        feed(&mut g, "abcde\x1b[Cf");
+        assert_eq!((line(&g, 0), line(&g, 1)), ("abcdf".to_string(), String::new()));
     }
 }
