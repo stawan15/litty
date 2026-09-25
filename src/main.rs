@@ -1002,17 +1002,17 @@ impl App {
 
     /// Text of the update notice: a short pill, or the prompt once opened.
     fn update_notice(&self) -> Option<String> {
-        let key = if cfg!(target_os = "macos") { "Cmd+Shift+U" } else { "Ctrl+Shift+U" };
+        let key = if cfg!(target_os = "macos") { "⇧⌘U" } else { "Ctrl+Shift+U" };
         Some(match &self.update {
             update::State::None => return None,
-            update::State::Available(v) if !self.update_open => format!("↑ litty {v}  {key}"),
+            update::State::Available(v) if !self.update_open => format!("↑ {v}  {key}"),
             update::State::Available(v) => match &self.update_managed {
-                Some(cmd) => format!("litty {v} available · {cmd} · Enter: copy · Esc: skip"),
-                None => format!("litty {v} available · Enter: update on quit · Esc: skip"),
+                Some(cmd) => format!("{v} · {cmd} · Enter: copy · Esc: skip"),
+                None => format!("{v} · Enter: update on quit · Esc: skip"),
             },
-            update::State::Downloading(v) => format!("downloading litty {v}…"),
-            update::State::Staged(v, _) => format!("litty {v} ready · installs when you quit"),
-            update::State::Failed(msg) => format!("update failed: {msg} · {key} to dismiss"),
+            update::State::Downloading(v) => format!("downloading {v}…"),
+            update::State::Staged(v, _) => format!("{v} installs on quit"),
+            update::State::Failed(msg) => format!("update failed: {msg}  {key}"),
         })
     }
 

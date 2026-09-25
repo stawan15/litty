@@ -452,7 +452,7 @@ impl Renderer {
         };
         let label = format!("find: {query}|  {status}");
         let (bw, bh) = (label.chars().count() * cw + 8 * u, ch + 4 * u);
-        let bx = (rect.x + rect.w).saturating_sub(6 * u + bw).max(rect.x);
+        let bx = (rect.x + rect.w / cw * cw).saturating_sub(2 * u + bw).max(rect.x);
         let by = rect.y;
         self.fill(bx, by, bw, bh, 0x7aa2f7);
         self.fill(bx + u, by + u, bw - 2 * u, bh - 2 * u, 0x24283b);
@@ -464,8 +464,9 @@ impl Renderer {
         let fit = rect.w.saturating_sub(14 * u) / cw;
         let label: String = text.chars().take(fit).collect();
         let (bw, bh) = (label.chars().count() * cw + 8 * u, ch + 4 * u);
-        let bx = (rect.x + rect.w).saturating_sub(6 * u + bw).max(rect.x);
-        let by = (rect.y + rect.h).saturating_sub(bh + 2 * u).max(rect.y);
+        // Inside the rows of the grid (not its leftover pixels), so repainting the rows erases it.
+        let bx = (rect.x + rect.w / cw * cw).saturating_sub(2 * u + bw).max(rect.x);
+        let by = (rect.y + rect.h / ch * ch).saturating_sub(bh).max(rect.y);
         self.fill(bx, by, bw, bh, 0x565f89);
         self.fill(bx + u, by + u, bw - 2 * u, bh - 2 * u, 0x24283b);
         self.text(&label, bx + 4 * u, by + 2 * u, 0xc0caf5);
@@ -537,5 +538,29 @@ impl Renderer {
         let (y0, h) = (oy as i32 + ascent - g.m.ymin - g.m.height as i32, g.m.height);
         blend_glyph(&mut self.fb, self.w, self.clip, g, ox, oy, ascent, fg);
         self.mark((y0.max(0) as usize).max(self.clip[1]), ((y0 + h as i32).max(0) as usize).min(self.clip[3]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(notices: &[&str]) -> Vec<u32> {
+        let mut r = Renderer::new(28.0, 20);
+        r.resize(800, 500);
+        let rect = r.area();
+        let (cols, rows) = r.grid_size(rect);
+        let mut g = Grid::new(cols, rows);
+        for n in notices {
+            g.dirty.fill(true);
+            r.draw_pane(&mut g, &PaneView { rect, focused: true, cursor_on: true, find: None, notice: Some(n) });
+        }
+        r.fb
+    }
+
+    #[test]
+    fn a_shorter_notice_leaves_nothing_of_the_longer_one() {
+        let long = "0.3.2 · Enter: update on quit · Esc: skip";
+        assert!(frame(&[long, "downloading 0.3.2…"]) == frame(&["downloading 0.3.2…"]));
     }
 }

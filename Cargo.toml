@@ -1,6 +1,6 @@
 [package]
 name = "litty-term"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "litty: a tiny, fast, zero-config terminal emulator for macOS and Linux"
 license = "MIT"
