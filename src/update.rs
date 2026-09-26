@@ -17,6 +17,8 @@ pub enum Event {
     Found(String),
     /// The new version was downloaded, verified and unpacked, ready to be swapped in on quit.
     Staged(String, PathBuf),
+    /// The new version's system package (.deb or .rpm) was installed; it runs from the next launch.
+    Installed(String),
     /// An explicit check found nothing newer.
     Current,
     Failed(String),
@@ -29,6 +31,7 @@ pub enum State {
     Available(String),
     Downloading(String),
     Staged(String, PathBuf),
+    Installed(String),
     Failed(String),
 }
 
@@ -127,6 +130,26 @@ fn app_bundle() -> Option<PathBuf> {
     app.extension().is_some_and(|e| e == "app").then_some(app)
 }
 
+/// The system package format ("deb" or "rpm") that owns this installation, when litty can upgrade
+/// it through pkexec (which asks for the password in a desktop dialog).
+fn package(exe: &Path) -> Option<&'static str> {
+    if !exe.starts_with("/usr/") || !Path::new("/usr/bin/pkexec").exists() {
+        return None;
+    }
+    if Path::new("/var/lib/dpkg/info/litty.list").exists() {
+        Some("deb")
+    } else if Command::new("rpm").arg("-qf").arg(exe).output().is_ok_and(|o| o.status.success()) {
+        Some("rpm")
+    } else {
+        None
+    }
+}
+
+/// Whether an update is a system package that `stage` installs right away.
+pub fn installs_now() -> bool {
+    exe().as_deref().and_then(package).is_some()
+}
+
 fn writable_dir(dir: &Path) -> bool {
     let probe = dir.join(".litty-write-test");
     let ok = std::fs::write(&probe, b"").is_ok();
@@ -153,6 +176,8 @@ pub fn managed_by() -> Option<String> {
         Some("nix profile upgrade litty".into())
     } else if path.contains("/.cargo/bin/") {
         Some("cargo install litty-term".into())
+    } else if package(&exe).is_some() {
+        None
     } else if path.starts_with("/usr/") {
         Some("update litty with your package manager".into())
     } else {
@@ -180,8 +205,9 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     }
 }
 
-/// Download, verify and unpack release `version`; returns what `apply` should install.
-pub fn stage(version: &str) -> Result<PathBuf, String> {
+/// Download, verify and unpack release `version` for `apply` to swap in on quit. A system package is
+/// installed right away instead.
+pub fn stage(version: &str) -> Result<Event, String> {
     let dir = cache_dir().ok_or("no cache directory")?.join("staged-update");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -201,13 +227,24 @@ pub fn stage(version: &str) -> Result<PathBuf, String> {
         let copied = run(Command::new("ditto").arg(mnt.join("litty.app")).arg(dir.join("litty.app")));
         let _ = run(Command::new("hdiutil").args(["detach", "-quiet"]).arg(&mnt));
         copied?;
-        Ok(dir.join("litty.app"))
+        Ok(Event::Staged(version.into(), dir.join("litty.app")))
+    } else if let Some(kind) = exe().as_deref().and_then(package) {
+        let arch = std::env::consts::ARCH;
+        let (file, install) = if kind == "deb" {
+            (format!("litty_{version}-1_{}.deb", if arch == "aarch64" { "arm64" } else { "amd64" }), ["dpkg", "-i"])
+        } else {
+            (format!("litty-{version}-1.{arch}.rpm"), ["rpm", "-U"])
+        };
+        let file = fetch(&file)?;
+        run(Command::new("pkexec").args(install).arg(&file)).map_err(|_| "install cancelled".to_string())?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(Event::Installed(version.into()))
     } else {
         let arch = if std::env::consts::ARCH == "aarch64" { "aarch64" } else { "x86_64" };
         let name = format!("litty-{version}-{arch}-unknown-linux-gnu");
         let tar = fetch(&format!("{name}.tar.gz"))?;
         run(Command::new("tar").arg("-xzf").arg(&tar).arg("-C").arg(&dir))?;
-        Ok(dir.join(&name).join("litty"))
+        Ok(Event::Staged(version.into(), dir.join(&name).join("litty")))
     }
 }
 

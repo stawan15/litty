@@ -111,7 +111,7 @@ fn blend_rgba(fb: &mut [u32], w: usize, clip: [usize; 4], bmp: &crate::emoji::Bi
 }
 
 /// Blend `a` toward `b`: result = a*pct% + b*(100-pct)%.
-fn mix_color(a: u32, b: u32, pct: u32) -> u32 {
+pub(crate) fn mix_color(a: u32, b: u32, pct: u32) -> u32 {
     let ch = |shift: u32| {
         let (x, y) = ((a >> shift) & 255, (b >> shift) & 255);
         (x * pct + y * (100 - pct)) / 100
@@ -479,14 +479,21 @@ impl Renderer {
         true
     }
 
-    fn draw_notice(&mut self, text: &str, rect: Rect) {
+    /// Where the notice for `text` sits in `rect`: (x, y, width, height) in pixels.
+    pub fn notice_box(&self, text: &str, rect: Rect) -> (usize, usize, usize, usize) {
         let (u, cw, ch) = (self.unit(), self.fonts.cell_w, self.fonts.cell_h);
         let fit = rect.w.saturating_sub(14 * u) / cw;
-        let label: String = text.chars().take(fit).collect();
-        let (bw, bh) = (label.chars().count() * cw + 8 * u, ch + 4 * u);
+        let (bw, bh) = (text.chars().count().min(fit) * cw + 8 * u, ch + 4 * u);
         // Inside the rows of the grid (not its leftover pixels), so repainting the rows erases it.
         let bx = (rect.x + rect.w / cw * cw).saturating_sub(2 * u + bw).max(rect.x);
         let by = (rect.y + rect.h / ch * ch).saturating_sub(bh).max(rect.y);
+        (bx, by, bw, bh)
+    }
+
+    fn draw_notice(&mut self, text: &str, rect: Rect) {
+        let u = self.unit();
+        let (bx, by, bw, bh) = self.notice_box(text, rect);
+        let label: String = text.chars().take((bw - 8 * u) / self.fonts.cell_w).collect();
         self.fill(bx, by, bw, bh, theme().tab_text);
         self.fill(bx + u, by + u, bw - 2 * u, bh - 2 * u, theme().panel_bg);
         self.text(&label, bx + 4 * u, by + 2 * u, theme().fg);

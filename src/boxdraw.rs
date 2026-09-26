@@ -52,6 +52,29 @@ impl Renderer {
                 self.block(c, x, y, cw, chh, fg, bg);
                 true
             }
+            // Powerline's solid arrows, drawn to fill the whole cell so prompt segments join up.
+            c @ (0xE0B0 | 0xE0B2) => {
+                for r in 0..chh {
+                    // Arrow width on this row, from the pixel row's centre.
+                    let tip = 1.0 - ((2 * r + 1) as f32 - chh as f32).abs() / chh as f32;
+                    let reach = tip * cw as f32;
+                    let full = (reach as usize).min(cw);
+                    // A solid run from the flat side, then one antialiased edge pixel.
+                    let edge = crate::render::mix_color(fg, bg, (reach.fract() * 100.0) as u32);
+                    if c == 0xE0B0 {
+                        self.fill(x, y + r, full, 1, fg);
+                        if full < cw {
+                            self.fill(x + full, y + r, 1, 1, edge);
+                        }
+                    } else {
+                        self.fill(x + cw - full, y + r, full, 1, fg);
+                        if full < cw {
+                            self.fill(x + cw - full - 1, y + r, 1, 1, edge);
+                        }
+                    }
+                }
+                true
+            }
             _ => false,
         }
     }

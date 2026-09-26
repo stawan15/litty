@@ -222,6 +222,8 @@ struct UpdateUi {
     open: bool,
     /// The package-manager command for updating, when litty may not replace itself.
     managed: Option<String>,
+    /// The update is a system package, installed as soon as it's downloaded.
+    installs_now: bool,
     /// A check the user asked for (from the tray) is running.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     checking: bool,
@@ -264,10 +266,7 @@ fn install_update(ui: &RefCell<UpdateUi>, proxy: &EventLoopProxy<Ev>) {
     ui.state = update::State::Downloading(version.clone());
     let proxy = proxy.clone();
     std::thread::spawn(move || {
-        let ev = match update::stage(&version) {
-            Ok(path) => update::Event::Staged(version, path),
-            Err(msg) => update::Event::Failed(msg),
-        };
+        let ev = update::stage(&version).unwrap_or_else(update::Event::Failed);
         let _ = proxy.send_event(Ev::Update(ev));
     });
 }
@@ -1100,18 +1099,7 @@ impl Win {
             "r" if shift => self.toggle_recording(),
             "k" => self.clear_screen(),
             "n" => self.new_window(),
-            "u" if shift => {
-                {
-                    let mut ui = self.ui.borrow_mut();
-                    match ui.state {
-                        update::State::None => {}
-                        update::State::Failed(_) => ui.state = update::State::None,
-                        _ => ui.open = !ui.open,
-                    }
-                    ui.generation += 1;
-                }
-                self.notice_changed();
-            }
+            "u" if shift => self.toggle_update_prompt(),
             "f" => {
                 self.find = Some(String::new());
                 self.find_changed();
@@ -1178,12 +1166,42 @@ impl Win {
             update::State::Available(v) if !ui.open => format!("↑ {v}  {key}"),
             update::State::Available(v) => match &ui.managed {
                 Some(cmd) => format!("{v} · {cmd} · Enter: copy · Esc: skip"),
+                None if ui.installs_now => format!("{v} · Enter: install · Esc: skip"),
                 None => format!("{v} · Enter: update on quit · Esc: skip"),
             },
             update::State::Downloading(v) => format!("downloading {v}…"),
             update::State::Staged(v, _) => format!("{v} installs on quit"),
+            update::State::Installed(v) => format!("{v} installed · restart litty"),
             update::State::Failed(msg) => format!("update failed: {msg}  {key}"),
         })
+    }
+
+    /// Open or close the update prompt; a finished or failed update's notice is dismissed.
+    fn toggle_update_prompt(&mut self) {
+        self.set_update(|ui| match ui.state {
+            update::State::None => {}
+            update::State::Failed(_) | update::State::Installed(_) => ui.state = update::State::None,
+            _ => ui.open = !ui.open,
+        });
+    }
+
+    /// A click on the update notice works like its keys (Ubuntu's input method takes Ctrl+Shift+U).
+    fn click_update_notice(&mut self) -> bool {
+        let rect = self.active_rect();
+        let (Some(text), Some(r)) = (self.update_notice().filter(|_| self.flash.is_none()), &self.renderer) else { return false };
+        let (x, y, w, h) = r.notice_box(&text, rect);
+        let (cx, cy) = (self.cursor.0 as usize, self.cursor.1 as usize);
+        if self.term().lock().unwrap().recorder.is_some() || !(x..x + w).contains(&cx) || !(y..y + h).contains(&cy) {
+            return false;
+        }
+        let ready = { let ui = self.ui.borrow(); ui.open && matches!(ui.state, update::State::Available(_)) };
+        if ready {
+            install_update(&self.ui, &self.proxy);
+            self.notice_changed();
+        } else {
+            self.toggle_update_prompt();
+        }
+        true
     }
 
     /// Repaint the active tab so the notice appears, changes or disappears.
@@ -1426,6 +1444,9 @@ impl Win {
                     _ => {}
                 }
             }
+            return;
+        }
+        if code == 0 && pressed && self.click_update_notice() {
             return;
         }
         if code == 0 {
@@ -1890,7 +1911,7 @@ impl App {
             update::State::Downloading(_) => TrayMode::Loading,
             _ if done.is_some() => TrayMode::Done(done.is_some_and(|d| d.0)),
             _ if running.is_some_and(|t| t <= now) => TrayMode::Running,
-            update::State::Available(_) | update::State::Staged(..) => TrayMode::Update,
+            update::State::Available(_) | update::State::Staged(..) | update::State::Installed(_) => TrayMode::Update,
             _ => TrayMode::Idle,
         };
         if self.tray_generation != Some(ui.generation) {
@@ -1911,6 +1932,7 @@ impl App {
                 }
                 update::State::Downloading(new) => (format!("Downloading {new}…"), None),
                 update::State::Staged(new, _) => (format!("{new} installs when litty quits"), None),
+                update::State::Installed(new) => (format!("{new} installed, restart litty"), None),
                 update::State::Failed(msg) => (format!("Update failed: {msg}"), check),
             };
             tray.set_menu(&status, action);
@@ -2007,9 +2029,11 @@ impl ApplicationHandler<Ev> for App {
                     ui.state = match e {
                         update::Event::Found(v) => {
                             ui.managed = update::managed_by();
+                            ui.installs_now = update::installs_now();
                             update::State::Available(v)
                         }
                         update::Event::Staged(v, path) => update::State::Staged(v, path),
+                        update::Event::Installed(v) => update::State::Installed(v),
                         update::Event::Failed(msg) => update::State::Failed(msg),
                         update::Event::Current => update::State::None,
                     };
