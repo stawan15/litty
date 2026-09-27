@@ -38,20 +38,25 @@ fn user_family() -> Option<&'static Family> {
 
 /// The font the config names (`font = ...`), preferred over everything else.
 fn config_family() -> Option<&'static Family> {
-    static CONFIG: OnceLock<Option<Family>> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let regular = font_path(crate::config::get().font.as_deref()?)?;
-            let leak = |p: String| -> &'static str { Box::leak(p.into_boxed_str()) };
-            // Bold and italic are the files named like the regular one (…-Regular.ttf → …-Bold.ttf).
-            let sibling = |style: &str| {
-                let p = regular.replacen("Regular", style, 1);
-                if p != regular && std::path::Path::new(&p).exists() { leak(p) } else { "" }
-            };
-            let files = [sibling("Bold"), sibling("Italic"), sibling("BoldItalic")];
-            Some(Family { files: [leak(regular.clone()), files[0], files[1], files[2]], index: [0; 4] })
-        })
-        .as_ref()
+    // The font named when last looked up; looked up again when the settings name another.
+    static CONFIG: Mutex<Option<(String, Option<&'static Family>)>> = Mutex::new(None);
+    let want = crate::config::get().font.clone()?;
+    let mut cache = CONFIG.lock().unwrap();
+    if let Some((_, family)) = cache.as_ref().filter(|(name, _)| *name == want) {
+        return *family;
+    }
+    let leak = |p: String| -> &'static str { Box::leak(p.into_boxed_str()) };
+    let family = font_path(&want).map(|regular| {
+        // Bold and italic are the files named like the regular one (…-Regular.ttf → …-Bold.ttf).
+        let sibling = |style: &str| {
+            let p = regular.replacen("Regular", style, 1);
+            if p != regular && std::path::Path::new(&p).exists() { leak(p) } else { "" }
+        };
+        let files = [sibling("Bold"), sibling("Italic"), sibling("BoldItalic")];
+        &*Box::leak(Box::new(Family { files: [leak(regular.clone()), files[0], files[1], files[2]], index: [0; 4] }))
+    });
+    *cache = Some((want, family));
+    family
 }
 
 /// A font file for `want`: a path (`~/` allowed), or a family name looked up with fontconfig and

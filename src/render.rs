@@ -290,6 +290,17 @@ impl Renderer {
         if images {
             self.draw_images(g, view.rect, &drawn);
         }
+        // Progress a program reports (OSC 9;4): a thin bar along the top of the pane.
+        if let Some((state, pct)) = g.progress {
+            let (color, pct) = match state {
+                2 => (theme().fail_text, if pct == 0 { 100 } else { pct }),
+                3 => (mix_color(theme().accent, def_bg(), 40), 100),
+                4 => (theme().tab_text, pct),
+                _ => (theme().accent, pct),
+            };
+            let w = g.cols * self.fonts.cell_w * pct as usize / 100;
+            self.fill(view.rect.x, view.rect.y, w, 2 * self.unit(), color);
+        }
         g.drawn_cursor_row = g.cy;
         if let Some(q) = view.find {
             self.draw_find_bar(g, q, view.rect);
@@ -603,6 +614,46 @@ impl Renderer {
         self.fill(bx, by, bw, bh, theme().tab_text);
         self.fill(bx + u, by + u, bw - 2 * u, bh - 2 * u, theme().panel_bg);
         self.text(&label, bx + 4 * u, by + 2 * u, theme().fg);
+    }
+
+    /// A right-click menu opened at `at`: its box, and each item's (top, bottom) in pixels.
+    /// Items titled "-" are separators.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn menu_layout(&self, items: &[&str], at: (usize, usize)) -> (Rect, Vec<(usize, usize)>) {
+        let (u, cw, ch) = (self.unit(), self.fonts.cell_w, self.fonts.cell_h);
+        let w = items.iter().map(|t| t.chars().count()).max().unwrap_or(0) * cw + 12 * u;
+        let (mut y, mut rows) = (2 * u, Vec::new());
+        for t in items {
+            let h = if *t == "-" { 5 * u } else { ch + 3 * u };
+            rows.push((y, y + h));
+            y += h;
+        }
+        let h = y + 2 * u;
+        // Kept inside the window.
+        let x = at.0.min(self.w.saturating_sub(w));
+        let y = at.1.min(self.h.saturating_sub(h));
+        (Rect { x, y, w, h }, rows.into_iter().map(|(a, b)| (y + a, y + b)).collect())
+    }
+
+    /// Draw the menu; disabled items are dimmed and `hover` is highlighted.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn draw_menu(&mut self, items: &[(&str, bool)], at: (usize, usize), hover: Option<usize>) {
+        let u = self.unit();
+        let titles: Vec<&str> = items.iter().map(|i| i.0).collect();
+        let (b, rows) = self.menu_layout(&titles, at);
+        self.fill(b.x, b.y, b.w, b.h, theme().divider);
+        self.fill(b.x + u, b.y + u, b.w - 2 * u, b.h - 2 * u, theme().panel_bg);
+        for (i, (&(title, enabled), &(y0, y1))) in items.iter().zip(&rows).enumerate() {
+            if title == "-" {
+                self.fill(b.x + 4 * u, (y0 + y1) / 2, b.w - 8 * u, u, theme().divider);
+                continue;
+            }
+            if hover == Some(i) && enabled {
+                self.fill(b.x + 2 * u, y0, b.w - 4 * u, y1 - y0, theme().sel_bg);
+            }
+            let color = if enabled { theme().fg } else { theme().tab_text };
+            self.text(title, b.x + 6 * u, y0 + (y1 - y0 - self.fonts.cell_h) / 2, color);
+        }
     }
 
     /// The underline of one cell at (x, y), in its SGR 4:n style and SGR 58 colour.

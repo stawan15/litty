@@ -128,7 +128,7 @@ impl HLine {
 // Tokyo Night palette.
 
 /// The cursor shape and blinking chosen in the config file (a steady block by default).
-fn default_cursor() -> (CursorShape, bool) {
+pub(crate) fn default_cursor() -> (CursorShape, bool) {
     let c = crate::config::get();
     (
         match c.cursor {
@@ -249,6 +249,8 @@ pub struct Grid {
     pub cell_px: (usize, usize),
     /// A notification a program asked for (OSC 9 or OSC 777): (title, body); taken by the app.
     pub alert: Option<(String, String)>,
+    /// Progress a program reports (OSC 9;4): (state 1 normal / 2 error / 3 busy / 4 paused, percent).
+    pub progress: Option<(u8, u8)>,
     pen_fg: u32,
     pen_bg: u32,
     pen_rev: bool,
@@ -327,6 +329,7 @@ impl Grid {
             cur_match: 0,
             finished: None,
             alert: None,
+            progress: None,
             graphics: Default::default(),
             cell_px: (10, 20),
             pen_fg: def_fg(),
@@ -663,11 +666,23 @@ impl Grid {
         self.marks.back().filter(|m| m.end.is_none()).and_then(|m| m.started)
     }
 
+    /// The progress bar is drawn over the top row: repaint it when the bar changes.
+    fn set_progress(&mut self, p: Option<(u8, u8)>) {
+        if self.progress != p {
+            self.progress = p;
+            self.dirty[0] = true;
+        }
+    }
+
     /// Handle OSC 133 semantic prompt marks: A = prompt start, C = command start, D = finished.
     fn semantic_prompt(&mut self, kind: &[u8], rest: &[&[u8]]) {
         let line = self.pushed + self.cy as u64;
         match kind {
-            b"A" => self.marks.push_back(Mark { start: line, out: None, end: None, exit: None, started: None, took: None, command: None }),
+            b"A" => {
+                // Back at the prompt: a progress bar the program left behind is over.
+                self.set_progress(None);
+                self.marks.push_back(Mark { start: line, out: None, end: None, exit: None, started: None, took: None, command: None });
+            }
             b"C" => {
                 if let Some(m) = self.marks.back_mut().filter(|m| m.out.is_none()) {
                     (m.out, m.started) = (Some(line), Some(Instant::now()));
@@ -762,6 +777,31 @@ impl Grid {
     }
 
     /// Cmd+K: wipe screen, scrollback and command blocks.
+    /// The theme changed from `old` to `new`: default and ANSI colours are mapped over everywhere
+    /// (screen, alternate screen, scrollback, pen). Other colours are kept.
+    pub fn recolor(&mut self, old: &crate::theme::Theme, new: &crate::theme::Theme) {
+        let map = |c: u32| {
+            let rgb = c & 0xffffff;
+            let to = if rgb == old.fg {
+                new.fg
+            } else if rgb == old.bg {
+                new.bg
+            } else {
+                old.ansi.iter().position(|&a| a == rgb).map_or(rgb, |i| new.ansi[i])
+            };
+            c & 0xff00_0000 | to
+        };
+        for c in self.cells.iter_mut().chain(self.alt_cells.iter_mut()) {
+            (c.fg, c.bg) = (map(c.fg), map(c.bg));
+        }
+        for r in self.history.iter_mut().flat_map(|l| l.runs.iter_mut()) {
+            (r.fg, r.bg) = (map(r.fg), map(r.bg));
+        }
+        (self.pen_fg, self.pen_bg) = (map(self.pen_fg), map(self.pen_bg));
+        (self.saved_pen.0, self.saved_pen.1) = (map(self.saved_pen.0), map(self.saved_pen.1));
+        self.dirty.fill(true);
+    }
+
     pub fn clear_all(&mut self) {
         let blank = Cell::blank(def_fg(), def_bg());
         self.cells.fill(blank);
@@ -1370,6 +1410,17 @@ impl Perform for Grid {
             [b"133", kind, rest @ ..] => self.semantic_prompt(kind, rest),
             // OSC 777;notify;title;body (urxvt, foot, Ghostty).
             [b"777", b"notify", title, body @ ..] => self.alert = Some((notice_text(title), notice_text(&body.join(&b';')))),
+            // OSC 9;4;state;percent (ConEmu, Windows Terminal): 0 clears, 1 normal, 2 error,
+            // 3 indeterminate, 4 paused.
+            [b"9", b"4", state, pct @ ..] => {
+                let pct = pct.first().and_then(|p| std::str::from_utf8(p).ok()?.parse::<u8>().ok()).map_or(0, |p| p.min(100));
+                let progress = match *state {
+                    b"1" | b"2" | b"4" => Some((state[0] - b'0', pct)),
+                    b"3" => Some((3, 0)),
+                    _ => None,
+                };
+                self.set_progress(progress);
+            }
             // OSC 9;message (iTerm2). ConEmu's OSC 9;<number>;... (progress and so on) is not a message.
             [b"9", msg @ ..] if !msg.is_empty() && !(msg.len() > 1 && msg[0].iter().all(u8::is_ascii_digit)) => {
                 let title = if self.tab_title.is_empty() { "litty".into() } else { self.tab_title.clone() };
@@ -1832,9 +1883,27 @@ mod tests {
         assert_eq!(g.alert.take(), Some(("Build".into(), "done; all green".into())));
         feed(&mut g, "\x1b]2;vim\x07\x1b]9;tests passed\x07");
         assert_eq!(g.alert.take(), Some(("vim".into(), "tests passed".into())));
-        // ConEmu progress reports are not messages.
+        // ConEmu progress reports are not messages; the prompt coming back ends them.
         feed(&mut g, "\x1b]9;4;1;50\x07");
-        assert_eq!(g.alert, None);
+        assert_eq!((g.alert.as_ref(), g.progress), (None, Some((1, 50))));
+        feed(&mut g, "\x1b]9;4;3\x07");
+        assert_eq!(g.progress, Some((3, 0)));
+        feed(&mut g, "\x1b]9;4;2;250\x07");
+        assert_eq!(g.progress, Some((2, 100)));
+        feed(&mut g, "\x1b]133;A\x07");
+        assert_eq!(g.progress, None);
+    }
+
+    #[test]
+    fn a_new_theme_recolours_screen_and_scrollback() {
+        use crate::theme::LIGHT;
+        let mut g = Grid::new(4, 1);
+        feed(&mut g, "\x1b[31ma\x1b[38;2;1;2;3mb\x1b[0m\r\nc");
+        g.recolor(crate::theme::theme(), &LIGHT);
+        let mut cells = Vec::new();
+        g.history[0].decode(&mut cells);
+        assert_eq!((cells[0].fg, cells[1].fg, cells[0].bg), (LIGHT.ansi[1], 0x010203, LIGHT.bg));
+        assert_eq!((g.row(0)[0].fg, g.row(0)[0].bg), (LIGHT.fg, LIGHT.bg));
     }
 
     #[test]
