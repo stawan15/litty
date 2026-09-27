@@ -4,6 +4,7 @@ mod emoji;
 mod font;
 mod graphics;
 mod grid;
+mod img;
 mod kitty;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -190,6 +191,38 @@ struct Tab {
     dividers: Vec<Divider>,
 }
 
+/// A tab's splits, folders and focused pane, for the session file and Reopen Closed Tab.
+fn tab_state(tab: &Tab, group: usize) -> session::TabState {
+    fn layout(node: &Node, tab: &Tab) -> session::Layout {
+        match node {
+            Node::Leaf(id) => session::Layout::Pane(tab.panes.iter().find(|p| p.id == *id).and_then(|p| p.term.lock().unwrap().grid.cwd.clone())),
+            Node::Split { vertical, ratio, a, b } => session::Layout::Split { vertical: *vertical, ratio: *ratio, a: Box::new(layout(a, tab)), b: Box::new(layout(b, tab)) },
+        }
+    }
+    let mut leaves = Vec::new();
+    tab.root.leaves(&mut leaves);
+    let active = leaves.iter().position(|&id| id == tab.active).unwrap_or(0);
+    session::TabState { group, active, layout: layout(&tab.root, tab) }
+}
+
+/// A dropped file's path as typed into a shell: characters the shell treats specially are
+/// escaped (non-ASCII never is), then a space so several files line up.
+fn shell_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    if s.chars().any(char::is_control) {
+        return format!("'{}' ", s.replace('\'', "'\\''"));
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || !c.is_ascii() || "/._-+,:@%".contains(c)) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push(' ');
+    out
+}
+
 /// Compute pane rectangles for `node` inside `rect`. Pane sizes snap to whole cells.
 fn layout(node: &Node, rect: Rect, cell: (usize, usize), gap: usize, out: &mut Vec<(usize, Rect)>, dividers: &mut Vec<Divider>, path: &mut Vec<bool>) {
     let Node::Split { vertical, ratio, a, b } = node else {
@@ -284,6 +317,8 @@ enum Want {
     Window(Option<String>),
     /// Quit litty, keeping the session for the next launch (Ctrl+Shift+Q on Linux).
     Quit,
+    /// Reopen the tab closed last.
+    Reopen,
 }
 
 /// One window: on macOS exactly one tab (native tabs are separate windows), elsewhere it draws its own tab bar.
@@ -327,6 +362,20 @@ struct Win {
     find: Option<String>,
     /// A short message in the corner ("saved ~/Desktop/…cast") and when it goes away.
     flash: Option<(String, Instant)>,
+    /// Several lines waiting for Enter before they are pasted into a shell: (bytes, lines).
+    pending_paste: Option<(Vec<u8>, usize)>,
+    /// The link under the mouse when the right-click menu opened.
+    link: Option<String>,
+    /// The right-click menu while open (drawn by litty; macOS uses a native menu).
+    #[cfg(not(target_os = "macos"))]
+    menu: Option<Menu>,
+}
+
+#[cfg(not(target_os = "macos"))]
+struct Menu {
+    items: Vec<(&'static str, &'static str, bool)>,
+    at: (usize, usize),
+    hover: Option<usize>,
 }
 
 const DEFAULT_PT: f32 = 14.0;
@@ -919,7 +968,8 @@ impl Win {
         } else {
             Vec::new()
         };
-        let notice = self.flash.as_ref().map(|f| f.0.clone()).or_else(|| self.update_notice());
+        let paste = self.pending_paste.as_ref().map(|p| format!("paste {} line{}? Enter: paste · Esc: cancel", p.1, if p.1 == 1 { "" } else { "s" }));
+        let notice = paste.or_else(|| self.flash.as_ref().map(|f| f.0.clone())).or_else(|| self.update_notice());
         let rec = format!("● rec · {} to stop", if cfg!(target_os = "macos") { "⌘⇧R" } else { "Ctrl+Shift+R" });
         let mut clip = None;
         for pane in self.tabs.iter().flat_map(|t| &t.panes) {
@@ -948,6 +998,11 @@ impl Win {
         match single {
             Some(pane) => r.draw_chrome(&dividers, Some(&pane.term.lock().unwrap().grid), &titles, self.active),
             None => r.draw_chrome(&dividers, None, &titles, self.active),
+        }
+        #[cfg(not(target_os = "macos"))]
+        if let Some(m) = &self.menu {
+            let items: Vec<(&str, bool)> = m.items.iter().map(|i| (i.0, i.2)).collect();
+            r.draw_menu(&items, m.at, m.hover);
         }
         let damage = r.take_damage();
         presenter.present(&r.fb, damage);
@@ -1042,21 +1097,7 @@ impl Win {
 
     /// The tabs of this window for the session file.
     fn session_tabs(&self, group: usize) -> Vec<session::TabState> {
-        fn layout(node: &Node, tab: &Tab) -> session::Layout {
-            match node {
-                Node::Leaf(id) => session::Layout::Pane(tab.panes.iter().find(|p| p.id == *id).and_then(|p| p.term.lock().unwrap().grid.cwd.clone())),
-                Node::Split { vertical, ratio, a, b } => session::Layout::Split { vertical: *vertical, ratio: *ratio, a: Box::new(layout(a, tab)), b: Box::new(layout(b, tab)) },
-            }
-        }
-        self.tabs
-            .iter()
-            .map(|tab| {
-                let mut leaves = Vec::new();
-                tab.root.leaves(&mut leaves);
-                let active = leaves.iter().position(|&id| id == tab.active).unwrap_or(0);
-                session::TabState { group, active, layout: layout(&tab.root, tab) }
-            })
-            .collect()
+        self.tabs.iter().map(|tab| tab_state(tab, group)).collect()
     }
 
     /// Rebuild a saved tab's splits in the current tab (which holds one pane) and focus its pane.
@@ -1133,6 +1174,10 @@ impl Win {
     fn close_pane(&mut self, t: usize, id: usize, hangup: bool) {
         let Some(tab) = self.tabs.get_mut(t) else { return };
         let Some(pos) = tab.panes.iter().position(|p| p.id == id) else { return };
+        if tab.panes.len() == 1 {
+            // The tab goes with its last pane: remember it (with the pane's folder) first.
+            session::closed(tab_state(tab, 0));
+        }
         let pane = tab.panes.remove(pos);
         if hangup && !pane.exited.load(Ordering::SeqCst) {
             // SAFETY: the child has not been reaped, so the pid is still ours.
@@ -1164,6 +1209,9 @@ impl Win {
 
     fn close_tab_at(&mut self, i: usize) {
         let tab = self.tabs.remove(i);
+        if !tab.panes.is_empty() {
+            session::closed(tab_state(&tab, 0));
+        }
         for pane in tab.panes {
             if !pane.exited.load(Ordering::SeqCst) {
                 // SAFETY: the child has not been reaped, so the pid is still ours.
@@ -1332,11 +1380,47 @@ impl Win {
 
     fn paste(&mut self) {
         let Some(text) = clipboard() else { return };
+        let (bracketed, alt) = {
+            let t = self.term().lock().unwrap();
+            (t.grid.bracketed_paste, t.grid.in_alt)
+        };
+        // Without bracketed paste a shell runs each line as it arrives: ask first.
+        let newlines = text.iter().filter(|&&b| b == b'\n').count();
+        if newlines > 0 && !bracketed && !alt && config::get().paste_warning {
+            let lines = newlines + usize::from(!text.ends_with(b"\n"));
+            self.pending_paste = Some((text, lines));
+            self.notice_changed();
+            return;
+        }
+        self.paste_bytes(&text);
+    }
+
+    /// Enter pastes the waiting lines, Esc (or any other key) drops them.
+    fn paste_key(&mut self, e: &KeyEvent) {
+        if let Key::Named(NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super | NamedKey::Meta) = e.logical_key {
+            return;
+        }
+        if let Some((text, _)) = self.pending_paste.take() {
+            if e.logical_key == Key::Named(NamedKey::Enter) {
+                self.paste_bytes(&text);
+            }
+            self.notice_changed();
+        }
+    }
+
+    /// Send text as a paste: wrapped for programs that asked for bracketed paste.
+    fn paste_bytes(&mut self, text: &[u8]) {
         let bracketed = self.term().lock().unwrap().grid.bracketed_paste;
         let mut out = Vec::with_capacity(text.len() + 12);
         if bracketed {
             out.extend(b"\x1b[200~");
-            out.extend(&text);
+            // A copied "end of paste" must not end the paste early and run what follows.
+            let mut rest = text;
+            while let Some(i) = rest.windows(6).position(|w| w == b"\x1b[201~") {
+                out.extend(&rest[..i]);
+                rest = &rest[i + 6..];
+            }
+            out.extend(rest);
             out.extend(b"\x1b[201~");
         } else {
             out.extend(text.iter().map(|&b| if b == b'\n' { b'\r' } else { b }));
@@ -1365,7 +1449,9 @@ impl Win {
             "q" if !cfg!(target_os = "macos") => self.want = Some(Want::Quit),
             "u" if shift => self.toggle_update_prompt(),
             "f" => self.start_find(),
+            "t" if shift && self.mods.super_key() => self.want = Some(Want::Reopen),
             "t" => self.open_tab(),
+            "," | "<" => self.open_settings(),
             "w" => self.close_active(),
             // Splits: Cmd+D right, Cmd+Shift+D down (Ctrl+Shift+O / E on Linux).
             "d" if self.mods.super_key() => self.split(!shift),
@@ -1404,6 +1490,97 @@ impl Win {
         self.rebuild();
     }
 
+    /// macOS: the settings window. Elsewhere: the config file in the default editor; it is
+    /// read again when litty's window gets the focus back.
+    fn open_settings(&mut self) {
+        #[cfg(target_os = "macos")]
+        macos::show_settings();
+        #[cfg(not(target_os = "macos"))]
+        if let Some(p) = config::file() {
+            Self::open_url(&p.to_string_lossy());
+        }
+    }
+
+    /// Right click: Copy, Paste, Open Link, splits, Clear, Reopen Closed Tab and Settings.
+    fn open_menu(&mut self, has_sel: bool, link: Option<String>) {
+        let mut items = vec![("Copy", "copy", has_sel), ("Paste", "paste", true)];
+        if link.is_some() {
+            items.push(("Open Link", "open-link", true));
+        }
+        items.extend([
+            ("-", "", false),
+            ("Split Right", "split-right", true),
+            ("Split Down", "split-down", true),
+            ("-", "", false),
+            ("Clear", "clear", true),
+            ("Reopen Closed Tab", "reopen-tab", session::has_closed()),
+            ("-", "", false),
+            ("Settings…", "settings", true),
+        ]);
+        self.link = link;
+        #[cfg(target_os = "macos")]
+        if let Some(w) = &self.window {
+            macos::context_menu(w, &items);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.menu = Some(Menu { items, at: (self.cursor.0 as usize, self.cursor.1 as usize), hover: None });
+            self.redraw_soon();
+        }
+    }
+
+    /// The menu item under the mouse.
+    #[cfg(not(target_os = "macos"))]
+    fn menu_hit(&self, m: &Menu) -> Option<usize> {
+        let r = self.renderer.as_ref()?;
+        let titles: Vec<&str> = m.items.iter().map(|i| i.0).collect();
+        let (b, rows) = r.menu_layout(&titles, m.at);
+        let (x, y) = (self.cursor.0 as usize, self.cursor.1 as usize);
+        if !(b.x..b.x + b.w).contains(&x) {
+            return None;
+        }
+        rows.iter().position(|&(y0, y1)| (y0..y1).contains(&y)).filter(|&i| m.items[i].2 && m.items[i].0 != "-")
+    }
+
+    /// Close the drawn menu and repaint what it covered.
+    #[cfg(not(target_os = "macos"))]
+    fn close_menu(&mut self) {
+        self.menu = None;
+        if let Some(r) = &mut self.renderer {
+            r.clear();
+        }
+        for p in &self.tab().panes {
+            p.term.lock().unwrap().grid.dirty.fill(true);
+        }
+        self.redraw_soon();
+    }
+
+    /// The settings changed (theme `old` was in use): recolour, re-cursor and re-font everything.
+    fn settings_changed(&mut self, old: &'static theme::Theme) {
+        let recolor = !std::ptr::eq(old, theme::theme());
+        let (shape, blink) = grid::default_cursor();
+        for p in self.tabs.iter().flat_map(|t| &t.panes) {
+            let mut t = p.term.lock().unwrap();
+            if recolor {
+                t.grid.recolor(old, theme::theme());
+            }
+            // Full-screen programs chose their own cursor; shells get the new one.
+            if !t.grid.in_alt {
+                (t.grid.cursor_shape, t.grid.cursor_blink) = (shape, blink);
+            }
+            t.grid.dirty.fill(true);
+        }
+        if let Some(pt) = config::get().font_size {
+            self.font_pt = pt;
+        }
+        if let Some(w) = &self.window {
+            w.set_theme(Some(if config::get().light { winit::window::Theme::Light } else { winit::window::Theme::Dark }));
+            #[cfg(target_os = "macos")]
+            macos::set_background(w, config::get().opacity, config::get().blur);
+        }
+        self.rebuild();
+    }
+
     /// Run a named action from a config keybind (names in `config::ACTIONS`).
     fn run_action(&mut self, action: &str) {
         match action {
@@ -1429,6 +1606,13 @@ impl Win {
             "toggle-zoom" => self.toggle_zoom(),
             "record" => self.toggle_recording(),
             "update" => self.toggle_update_prompt(),
+            "reopen-tab" => self.want = Some(Want::Reopen),
+            "settings" => self.open_settings(),
+            "open-link" => {
+                if let Some(url) = self.link.take() {
+                    Self::open_url(&url);
+                }
+            }
             _ => {}
         }
     }
@@ -1683,6 +1867,13 @@ impl Win {
     }
 
     fn on_key(&mut self, e: &KeyEvent) {
+        #[cfg(not(target_os = "macos"))]
+        if self.menu.is_some() {
+            return self.close_menu();
+        }
+        if self.pending_paste.is_some() {
+            return self.paste_key(e);
+        }
         let mods = self.mods;
         match self.keybind(e) {
             Some(Some(action)) => return self.run_action(action),
@@ -1802,6 +1993,20 @@ impl Win {
             _ => return,
         };
         let pressed = state == ElementState::Pressed;
+        #[cfg(not(target_os = "macos"))]
+        if let Some(menu) = self.menu.take() {
+            // A press picks an item or dismisses the menu; releases (the one that opened it) don't.
+            if !pressed {
+                self.menu = Some(menu);
+                return;
+            }
+            let pick = (code == 0).then(|| self.menu_hit(&menu)).flatten();
+            self.close_menu();
+            if let Some(i) = pick {
+                self.run_action(menu.items[i].1);
+            }
+            return;
+        }
         if let Some(hit) = self.tab_bar_hit() {
             if pressed {
                 match (code, hit) {
@@ -1860,6 +2065,11 @@ impl Win {
                 return;
             }
         }
+        if code == 2 && pressed && (t.grid.mouse == 0 || self.mods.shift_key()) {
+            let (has_sel, link) = (t.grid.sel.is_some(), t.grid.url_at(row, col));
+            drop(t);
+            return self.open_menu(has_sel, link);
+        }
         if t.grid.mouse != 0 && !self.mods.shift_key() {
             let report = mouse_report(&t.grid, code, self.mods, col, row, !pressed);
             drop(t);
@@ -1901,6 +2111,15 @@ impl Win {
     fn on_cursor_moved(&mut self, x: f64, y: f64) {
         self.cursor = (x, y);
         if self.tabs.is_empty() {
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        if let Some(m) = &self.menu {
+            let hover = self.menu_hit(m);
+            if hover != m.hover {
+                self.menu.as_mut().unwrap().hover = hover;
+                self.redraw_soon();
+            }
             return;
         }
         if let (Some(hit), false) = (self.tab_bar_hit(), self.selecting) {
@@ -2028,6 +2247,10 @@ impl Win {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = join;
+        #[cfg(target_os = "macos")]
+        if config::get().opacity < 1.0 {
+            macos::set_background(&window, config::get().opacity, config::get().blur);
+        }
         window.set_ime_allowed(true);
         let seen_generation = ui.borrow().generation;
         let mut win = Win {
@@ -2063,6 +2286,10 @@ impl Win {
             icon: CursorIcon::Default,
             find: None,
             flash: None,
+            pending_paste: None,
+            link: None,
+            #[cfg(not(target_os = "macos"))]
+            menu: None,
         };
         win.rebuild();
         win.new_tab(command, cwd);
@@ -2148,6 +2375,7 @@ impl Win {
             WindowEvent::MouseInput { state, button, .. } => self.on_mouse_button(state, button),
             WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(position.x, position.y),
             WindowEvent::MouseWheel { delta, .. } => self.on_wheel(delta),
+            WindowEvent::DroppedFile(path) => self.paste_bytes(shell_path(&path).as_bytes()),
             _ => {}
         }
     }
@@ -2184,6 +2412,9 @@ struct App {
     /// Update generation the tray menu shows.
     #[cfg(target_os = "macos")]
     tray_generation: Option<u64>,
+    /// Progress shown on the Dock icon.
+    #[cfg(target_os = "macos")]
+    badge: Option<(u8, u8)>,
 }
 
 impl App {
@@ -2209,6 +2440,7 @@ impl App {
                     Want::Tab(cwd) => self.add_window(el, &[], cwd, Some(id)),
                     Want::Window(cwd) => self.add_window(el, &[], cwd, None),
                     Want::Quit => self.quit(),
+                    Want::Reopen => self.reopen_tab(el, id),
                 }
             }
         }
@@ -2225,13 +2457,26 @@ impl App {
     /// bounces, the hamster shows how it went and a notification says what finished.
     fn take_finished(&mut self, now: Instant) {
         let (mut done, mut alerts) = (Vec::new(), Vec::new());
+        // Progress any pane reports, for the Dock badge; unknown while a parser is busy.
+        let (mut progress, mut known) = (None, true);
         for p in self.wins.values().flat_map(|w| w.tabs.iter().flat_map(|t| &t.panes)) {
             // Never wait for a busy parser: the result stays in the grid until the next look.
             if let Ok(mut t) = p.term.try_lock() {
                 done.extend(t.grid.finished.take().map(|f| (p.id, f)));
                 alerts.extend(t.grid.alert.take().map(|a| (p.id, a)));
+                progress = progress.or(t.grid.progress);
+            } else {
+                known = false;
             }
         }
+        #[cfg(target_os = "macos")]
+        if known && progress != self.badge {
+            self.badge = progress;
+            let label = progress.map(|(state, pct)| if state == 3 { "…".to_string() } else { format!("{pct}%") });
+            macos::dock_badge(label.as_deref());
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (progress, known);
         if (done.is_empty() && alerts.is_empty()) || self.wins.values().any(|w| w.focused) {
             return;
         }
@@ -2362,6 +2607,40 @@ impl App {
         w.focus_window();
     }
 
+    /// Reopen the tab closed last, next to window `id`'s tabs, with its splits and folders.
+    fn reopen_tab(&mut self, el: &ActiveEventLoop, id: WindowId) {
+        let Some(tab) = session::reopen() else { return };
+        let dir = tab.layout.first_dir().map(String::from);
+        #[cfg(target_os = "macos")]
+        let id = {
+            self.add_window(el, &[], dir, Some(id));
+            let Some(id) = self.last_focus else { return };
+            id
+        };
+        let Some(w) = self.wins.get_mut(&id) else { return };
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = el;
+            w.new_tab(&[], dir);
+        }
+        w.restore_tab(&tab);
+    }
+
+    /// The config file changed (settings window, or edited by hand): apply it to every window.
+    fn apply_settings(&mut self) {
+        let old = theme::theme();
+        theme::init(config::get().light, &config::get().colors);
+        for w in self.wins.values_mut() {
+            w.settings_changed(old);
+        }
+        #[cfg(target_os = "macos")]
+        match (config::get().tray, self.tray.is_some() || self.tray_at.is_some()) {
+            (true, false) => self.tray_at = Some(Instant::now()),
+            (false, true) => (self.tray, self.tray_at) = (None, None),
+            _ => {}
+        }
+    }
+
     /// Save the session, then close every window (the app exits when the last one goes).
     fn quit(&mut self) {
         self.save_session();
@@ -2438,6 +2717,9 @@ impl App {
 
     fn close_window(&mut self, id: WindowId) {
         if let Some(mut w) = self.wins.remove(&id) {
+            if !self.quitting && !self.is_quick(&w) {
+                w.tabs.iter().for_each(|t| session::closed(tab_state(t, 0)));
+            }
             w.shutdown();
             if self.wins.is_empty() && !self.is_quick(&w) {
                 w.save_state();
@@ -2476,6 +2758,7 @@ impl ApplicationHandler<Ev> for App {
         #[cfg(target_os = "macos")]
         {
             self.tray_wanted = config::get().tray;
+            macos::add_settings_menu();
             let proxy = Mutex::new(self.proxy.clone());
             macos::set_sink(Box::new(move |a| drop(proxy.lock().unwrap().send_event(Ev::Tray(a)))));
             if let Some((mods, key)) = &config::get().quick_terminal {
@@ -2568,6 +2851,15 @@ impl ApplicationHandler<Ev> for App {
                     }
                     macos::TrayAction::Quit => self.quit(),
                     macos::TrayAction::Quick => self.toggle_quick(el),
+                    macos::TrayAction::Settings => self.apply_settings(),
+                    macos::TrayAction::Action(i) => {
+                        let id = self.last_focus;
+                        if let (Some(w), Some(&action)) = (id.and_then(|id| self.wins.get_mut(&id)), config::ACTIONS.get(i)) {
+                            w.run_action(action);
+                        }
+                        self.settle(el, id);
+                        return;
+                    }
                 }
                 self.settle(el, None);
             }
@@ -2606,6 +2898,10 @@ impl ApplicationHandler<Ev> for App {
             event => {
                 if matches!(event, WindowEvent::Focused(true)) {
                     self.last_focus = Some(id);
+                    // Settings edited in another app apply when litty is back in front.
+                    if config::reload() {
+                        self.apply_settings();
+                    }
                 }
                 #[cfg(target_os = "macos")]
                 if self.tray_wanted && matches!(event, WindowEvent::RedrawRequested) {
@@ -2621,6 +2917,10 @@ impl ApplicationHandler<Ev> for App {
 }
 
 fn main() {
+    // `litty img FILE...` prints pictures in the current terminal and exits (no window).
+    if std::env::args().nth(1).as_deref() == Some("img") {
+        std::process::exit(img::main(&std::env::args().skip(2).collect::<Vec<_>>()));
+    }
     theme::init(config::get().light, &config::get().colors);
     // Launched from Finder or the Dock the working directory is "/": start in the home directory.
     if std::env::current_dir().is_ok_and(|d| d == std::path::Path::new("/")) {
@@ -2658,6 +2958,8 @@ fn main() {
         notifier: None,
         #[cfg(target_os = "macos")]
         tray_generation: None,
+        #[cfg(target_os = "macos")]
+        badge: None,
     };
     event_loop.run_app(&mut app).unwrap();
 }
@@ -2745,6 +3047,15 @@ mod tests {
         let (mut moved, mut d2) = (Vec::new(), Vec::new());
         layout(&root, area, (8, 16), 6, &mut moved, &mut d2, &mut Vec::new());
         assert!(moved[0].1.w < panes[0].1.w);
+    }
+
+    #[test]
+    fn dropped_paths_are_typed_safely() {
+        let p = |s: &str| shell_path(std::path::Path::new(s));
+        assert_eq!(p("/Users/me/My File (1).png"), "/Users/me/My\\ File\\ \\(1\\).png ");
+        assert_eq!(p("/tmp/ไฟล์.txt"), "/tmp/ไฟล์.txt ");
+        assert_eq!(p("/tmp/a$b;`c'"), "/tmp/a\\$b\\;\\`c\\' ");
+        assert_eq!(p("/tmp/x\ny"), "'/tmp/x\ny' ");
     }
 
     #[test]

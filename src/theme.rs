@@ -1,6 +1,6 @@
-//! Colours. The theme is chosen once at startup (see `config`), so cells can store plain RGB.
+//! Colours. Cells store plain RGB, so when the settings change the theme, `Grid::recolor` maps them over.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 pub struct Theme {
     pub fg: u32,
@@ -81,9 +81,9 @@ pub const LIGHT: Theme = Theme {
     cursor_block: None,
 };
 
-static THEME: OnceLock<&'static Theme> = OnceLock::new();
+static THEME: AtomicPtr<Theme> = AtomicPtr::new(std::ptr::null_mut());
 
-/// Fix the theme for the process (first call wins), with the config's colour overrides.
+/// Set the theme, with the config's colour overrides (again when the settings change).
 pub fn init(light: bool, colors: &[(usize, u32)]) {
     use crate::config::{BACKGROUND, CURSOR, FOREGROUND, SELECTION};
     let base = if light { &LIGHT } else { &DARK };
@@ -102,9 +102,10 @@ pub fn init(light: bool, colors: &[(usize, u32)]) {
         }
         Box::leak(Box::new(t))
     };
-    let _ = THEME.set(theme);
+    THEME.store(theme as *const Theme as *mut Theme, Ordering::Release);
 }
 
 pub fn theme() -> &'static Theme {
-    THEME.get().copied().unwrap_or(&DARK)
+    // SAFETY: only 'static themes (the built-in ones or leaked) are stored.
+    unsafe { THEME.load(Ordering::Acquire).as_ref() }.unwrap_or(&DARK)
 }

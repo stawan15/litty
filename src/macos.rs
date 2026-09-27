@@ -65,7 +65,14 @@ pub enum TrayAction {
     Focus(usize),
     /// The quick-terminal hotkey was pressed.
     Quick,
+    /// A right-click menu pick: the action at this index in `config::ACTIONS`.
+    Action(usize),
+    /// The settings window changed the config file.
+    Settings,
 }
+
+/// Menu item tags at and above this are right-click menu actions (tag - MENU = `config::ACTIONS` index).
+const MENU: isize = 100;
 
 /// Menu items carry their action as a tag: the index in this list.
 const ACTIONS: [TrayAction; 4] = [TrayAction::Check, TrayAction::Install, TrayAction::NewWindow, TrayAction::Quit];
@@ -166,9 +173,20 @@ define_class!(
         #[unsafe(method(pick:))]
         fn pick(&self, item: &AnyObject) {
             let tag: isize = unsafe { msg_send![item, tag] };
-            if let (Some(sink), Some(&action)) = (SINK.get(), ACTIONS.get(tag as usize)) {
+            let action = if tag >= MENU { Some(TrayAction::Action((tag - MENU) as usize)) } else { ACTIONS.get(tag as usize).copied() };
+            if let (Some(sink), Some(action)) = (SINK.get(), action) {
                 sink(action);
             }
+        }
+
+        #[unsafe(method(settings:))]
+        fn settings(&self, _item: &AnyObject) {
+            show_settings();
+        }
+
+        #[unsafe(method(changed:))]
+        fn changed(&self, control: &AnyObject) {
+            setting_changed(control);
         }
     }
 );
@@ -321,6 +339,245 @@ impl Tray {
             add("New Window", Some(TrayAction::NewWindow), "");
             add("Quit litty", Some(TrayAction::Quit), "");
         }
+    }
+}
+
+impl Drop for Tray {
+    fn drop(&mut self) {
+        // SAFETY: main thread; the item came from the system status bar.
+        unsafe {
+            let bar: Retained<AnyObject> = msg_send![class!(NSStatusBar), systemStatusBar];
+            let _: () = msg_send![&*bar, removeStatusItem: &*self._item];
+        }
+    }
+}
+
+// Right-click menu, settings window, see-through background and Dock badge.
+
+use objc2_foundation::{NSPoint, NSRect};
+use std::cell::RefCell;
+
+/// A native right-click menu at the mouse: (title, action from `config::ACTIONS`, enabled);
+/// "-" is a separator. Returns once the menu closes; a pick arrives as `TrayAction::Action`.
+pub fn context_menu(w: &Window, items: &[(&str, &str, bool)]) {
+    let Some(win) = ns_window(w) else { return };
+    // SAFETY: AppKit calls on the main thread; the target outlives the (modal) menu.
+    unsafe {
+        let app: Retained<AnyObject> = msg_send![class!(NSApplication), sharedApplication];
+        let event: Option<Retained<AnyObject>> = msg_send![&*app, currentEvent];
+        let view: Option<Retained<AnyObject>> = msg_send![&*win, contentView];
+        let (Some(event), Some(view)) = (event, view) else { return };
+        let target: Retained<Target> = msg_send![Target::class(), new];
+        let menu: Retained<AnyObject> = msg_send![class!(NSMenu), new];
+        let _: () = msg_send![&*menu, setAutoenablesItems: false];
+        for &(title, action, enabled) in items {
+            if title == "-" {
+                let sep: Retained<AnyObject> = msg_send![class!(NSMenuItem), separatorItem];
+                let _: () = msg_send![&*menu, addItem: &*sep];
+                continue;
+            }
+            let Some(i) = crate::config::ACTIONS.iter().position(|a| *a == action) else { continue };
+            let item: Retained<AnyObject> = msg_send![msg_send![class!(NSMenuItem), alloc], initWithTitle: &*NSString::from_str(title), action: objc2::sel!(pick:), keyEquivalent: &*NSString::from_str("")];
+            let _: () = msg_send![&*item, setTarget: &*target];
+            let _: () = msg_send![&*item, setTag: MENU + i as isize];
+            let _: () = msg_send![&*item, setEnabled: enabled];
+            let _: () = msg_send![&*menu, addItem: &*item];
+        }
+        let _: () = msg_send![class!(NSMenu), popUpContextMenu: &*menu, withEvent: &*event, forView: &*view];
+    }
+}
+
+/// Let the desktop show through the background (opacity < 1), blurred if asked. The blur uses
+/// the window server's CGSSetWindowBackgroundBlurRadius, as iTerm2, kitty and Alacritty do.
+pub fn set_background(w: &Window, opacity: f32, blur: bool) {
+    use nix::libc::{RTLD_DEFAULT, dlsym};
+    w.set_transparent(opacity < 1.0);
+    let Some(win) = ns_window(w) else { return };
+    // SAFETY: main thread; the private functions are looked up and skipped if missing.
+    unsafe {
+        let (conn, set) = (dlsym(RTLD_DEFAULT, c"CGSDefaultConnectionForThread".as_ptr()), dlsym(RTLD_DEFAULT, c"CGSSetWindowBackgroundBlurRadius".as_ptr()));
+        if conn.is_null() || set.is_null() {
+            return;
+        }
+        let conn: extern "C" fn() -> u32 = std::mem::transmute(conn);
+        let set: extern "C" fn(u32, u32, u32) -> i32 = std::mem::transmute(set);
+        let number: isize = msg_send![&*win, windowNumber];
+        set(conn(), number as u32, if blur && opacity < 1.0 { 20 } else { 0 });
+    }
+}
+
+/// The Dock icon's badge: progress a program reports ("40%"), or none.
+pub fn dock_badge(label: Option<&str>) {
+    // SAFETY: main thread.
+    unsafe {
+        let app: Retained<AnyObject> = msg_send![class!(NSApplication), sharedApplication];
+        let tile: Retained<AnyObject> = msg_send![&*app, dockTile];
+        let text = label.map(NSString::from_str);
+        let _: () = msg_send![&*tile, setBadgeLabel: text.as_deref()];
+    }
+}
+
+/// "Settings…  ⌘," in the app menu (the menu winit makes: About, separator, …).
+pub fn add_settings_menu() {
+    // SAFETY: main thread; the target is kept for the life of the app.
+    unsafe {
+        let app: Retained<AnyObject> = msg_send![class!(NSApplication), sharedApplication];
+        let main: Option<Retained<AnyObject>> = msg_send![&*app, mainMenu];
+        let Some(main) = main else { return };
+        let first: Option<Retained<AnyObject>> = msg_send![&*main, itemAtIndex: 0isize];
+        let Some(sub) = first.and_then(|f| -> Option<Retained<AnyObject>> { msg_send![&*f, submenu] }) else { return };
+        let target: Retained<Target> = msg_send![Target::class(), new];
+        let item: Retained<AnyObject> = msg_send![msg_send![class!(NSMenuItem), alloc], initWithTitle: &*NSString::from_str("Settings…"), action: objc2::sel!(settings:), keyEquivalent: &*NSString::from_str(",")];
+        let _: () = msg_send![&*item, setTarget: &*target];
+        let sep: Retained<AnyObject> = msg_send![class!(NSMenuItem), separatorItem];
+        let _: () = msg_send![&*sub, insertItem: &*item, atIndex: 2isize];
+        let _: () = msg_send![&*sub, insertItem: &*sep, atIndex: 3isize];
+        std::mem::forget(target);
+    }
+}
+
+/// Settings window controls, by tag: the config key each one writes.
+const SETTINGS: [&str; 11] = ["theme", "font", "font-size", "cursor", "cursor-blink", "background-opacity", "background-blur", "paste-warning", "restore", "tray", ""];
+const THEMES: [&str; 3] = ["dark", "light", "auto"];
+const CURSORS: [&str; 3] = ["block", "bar", "underline"];
+const SIZES: [&str; 11] = ["10", "11", "12", "13", "14", "15", "16", "18", "20", "22", "24"];
+
+thread_local! {
+    /// The settings window once made (kept, so reopening it is instant), and its controls' target.
+    static SETTINGS_WINDOW: RefCell<Option<(Retained<AnyObject>, Retained<Target>)>> = const { RefCell::new(None) };
+}
+
+/// Show the settings window: the common settings as native controls, applied as they change.
+pub fn show_settings() {
+    // SAFETY: AppKit calls on the main thread with valid receivers; objects are retained while used.
+    unsafe {
+        let app: Retained<AnyObject> = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![&*app, activateIgnoringOtherApps: true];
+        if let Some(win) = SETTINGS_WINDOW.with_borrow(|w| w.as_ref().map(|w| w.0.clone())) {
+            let _: () = msg_send![&*win, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+            return;
+        }
+        let target: Retained<Target> = msg_send![Target::class(), new];
+        let c = crate::config::get();
+        let raw = |key: &str| crate::config::value(key).unwrap_or_default();
+        let str_ = |s: &str| NSString::from_str(s);
+        // Tags are 1 + the index in SETTINGS (0 is every view's default).
+        let tagged = |view: Retained<AnyObject>, tag: isize| -> Retained<AnyObject> {
+            let _: () = msg_send![&*view, setTag: tag + 1];
+            let _: () = msg_send![&*view, setTarget: &*target];
+            let _: () = msg_send![&*view, setAction: objc2::sel!(changed:)];
+            view
+        };
+        let label = |text: &str| -> Retained<AnyObject> { msg_send![class!(NSTextField), labelWithString: &*str_(text)] };
+        let popup = |tag: isize, titles: &[&str], selected: usize| {
+            let p: Retained<AnyObject> = msg_send![msg_send![class!(NSPopUpButton), alloc], initWithFrame: NSRect::ZERO, pullsDown: false];
+            for t in titles {
+                let _: () = msg_send![&*p, addItemWithTitle: &*str_(t)];
+            }
+            let _: () = msg_send![&*p, selectItemAtIndex: selected as isize];
+            tagged(p, tag)
+        };
+        let check = |tag: isize, title: &str, on: bool| {
+            let b: Retained<AnyObject> = msg_send![class!(NSButton), checkboxWithTitle: &*str_(title), target: &*target, action: objc2::sel!(changed:)];
+            let _: () = msg_send![&*b, setState: on as isize];
+            tagged(b, tag)
+        };
+        let theme = THEMES.iter().position(|t| *t == raw("theme")).unwrap_or(c.light as usize);
+        let font: Retained<AnyObject> = msg_send![class!(NSTextField), textFieldWithString: &*str_(c.font.as_deref().unwrap_or(""))];
+        let _: () = msg_send![&*font, setPlaceholderString: &*str_("Maple Mono (built in)")];
+        let width: Retained<AnyObject> = msg_send![&*font, widthAnchor];
+        let min: Retained<AnyObject> = msg_send![&*width, constraintGreaterThanOrEqualToConstant: 220.0f64];
+        let _: () = msg_send![&*min, setActive: true];
+        let font = tagged(font, 1);
+        let size = format!("{}", c.font_size.unwrap_or(14.0));
+        let slider: Retained<AnyObject> = msg_send![class!(NSSlider), sliderWithValue: (c.opacity * 100.0) as f64, minValue: 30.0f64, maxValue: 100.0f64, target: &*target, action: objc2::sel!(changed:)];
+        let _: () = msg_send![&*slider, setContinuous: false];
+        let slider = tagged(slider, 5);
+        let open: Retained<AnyObject> = msg_send![class!(NSButton), buttonWithTitle: &*str_("Open Config File…"), target: &*target, action: objc2::sel!(changed:)];
+        let empty = || -> Retained<AnyObject> { msg_send![class!(NSGridCell), emptyContentView] };
+        let rows: Vec<[Retained<AnyObject>; 2]> = vec![
+            [label("Theme:"), popup(0, &["Dark", "Light", "Match System"], theme)],
+            [label("Font:"), font],
+            [label("Size:"), popup(2, &SIZES, SIZES.iter().position(|s| *s == size).unwrap_or(4))],
+            [label("Cursor:"), popup(3, &["Block", "Bar", "Underline"], c.cursor as usize)],
+            [empty(), check(4, "Blink", c.cursor_blink)],
+            [label("Background:"), slider],
+            [empty(), check(6, "Blur behind the window", c.blur)],
+            [label("Behaviour:"), check(7, "Ask before pasting several lines", c.paste_warning)],
+            [empty(), check(8, "Reopen tabs and splits at launch", c.restore)],
+            [empty(), check(9, "Show the hamster in the menu bar", c.tray)],
+            [empty(), tagged(open, 10)],
+        ];
+        let array = |views: &[Retained<AnyObject>]| -> Retained<AnyObject> {
+            let a: Retained<AnyObject> = msg_send![class!(NSMutableArray), new];
+            for v in views {
+                let _: () = msg_send![&*a, addObject: &**v];
+            }
+            a
+        };
+        let row_arrays: Vec<Retained<AnyObject>> = rows.iter().map(|r| array(r)).collect();
+        let grid: Retained<AnyObject> = msg_send![class!(NSGridView), gridViewWithViews: &*array(&row_arrays)];
+        let _: () = msg_send![&*grid, setRowSpacing: 10.0f64];
+        let _: () = msg_send![&*grid, setColumnSpacing: 12.0f64];
+        let first: Retained<AnyObject> = msg_send![&*grid, columnAtIndex: 0isize];
+        let _: () = msg_send![&*first, setXPlacement: 3isize]; // NSGridCellPlacementTrailing
+        let fit: NSSize = msg_send![&*grid, fittingSize];
+        let (w, h) = (fit.width.max(360.0), fit.height);
+        let _: () = msg_send![&*grid, setFrame: NSRect::new(NSPoint::new(24.0, 20.0), NSSize::new(w, h))];
+        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w + 48.0, h + 40.0));
+        // Titled | closable; buffered backing.
+        let win: Retained<AnyObject> = msg_send![msg_send![class!(NSWindow), alloc], initWithContentRect: rect, styleMask: 3usize, backing: 2usize, defer: false];
+        let _: () = msg_send![&*win, setReleasedWhenClosed: false];
+        let _: () = msg_send![&*win, setTitle: &*str_("litty Settings")];
+        let content: Retained<AnyObject> = msg_send![&*win, contentView];
+        let _: () = msg_send![&*content, addSubview: &*grid];
+        let _: () = msg_send![&*win, center];
+        let _: () = msg_send![&*win, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+        SETTINGS_WINDOW.with_borrow_mut(|w| *w = Some((win, target)));
+    }
+}
+
+/// A control in the settings window changed: write its key and tell the app.
+fn setting_changed(control: &AnyObject) {
+    // SAFETY: the control is one of the settings window's, on the main thread.
+    let (tag, value) = unsafe {
+        let tag: isize = msg_send![control, tag];
+        let tag = tag - 1;
+        let value = match tag {
+            0 | 2 | 3 => {
+                let i: isize = msg_send![control, indexOfSelectedItem];
+                let list: &[&str] = match tag {
+                    0 => &THEMES,
+                    2 => &SIZES,
+                    _ => &CURSORS,
+                };
+                list.get(i as usize).unwrap_or(&list[0]).to_string()
+            }
+            1 => {
+                let s: Retained<NSString> = msg_send![control, stringValue];
+                s.to_string().trim().to_string()
+            }
+            5 => {
+                let v: f64 = msg_send![control, doubleValue];
+                format!("{:.2}", v / 100.0)
+            }
+            10 => {
+                if let Some(p) = crate::config::file() {
+                    let _ = std::process::Command::new("open").arg("-t").arg(p).spawn();
+                }
+                return;
+            }
+            _ => {
+                let on: isize = msg_send![control, state];
+                (on != 0).to_string()
+            }
+        };
+        (tag, value)
+    };
+    let Some(key) = SETTINGS.get(tag as usize) else { return };
+    crate::config::set(key, &value);
+    if let Some(sink) = SINK.get() {
+        sink(TrayAction::Settings);
     }
 }
 

@@ -59,6 +59,25 @@ pub fn clear() {
     }
 }
 
+/// Tabs closed during this run, newest last, for Reopen Closed Tab.
+static CLOSED: std::sync::Mutex<Vec<TabState>> = std::sync::Mutex::new(Vec::new());
+
+pub fn closed(tab: TabState) {
+    let mut c = CLOSED.lock().unwrap();
+    if c.len() == 10 {
+        c.remove(0);
+    }
+    c.push(tab);
+}
+
+pub fn reopen() -> Option<TabState> {
+    CLOSED.lock().unwrap().pop()
+}
+
+pub fn has_closed() -> bool {
+    !CLOSED.lock().unwrap().is_empty()
+}
+
 pub fn encode(tabs: &[TabState]) -> String {
     fn layout(l: &Layout, out: &mut String) {
         match l {

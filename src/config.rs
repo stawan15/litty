@@ -14,10 +14,15 @@
 //!   term = xterm-litty             (TERM for programs; default xterm-256color)
 //!   restore = true | false         (reopen the tabs, splits and folders open at Quit)
 //!   quick-terminal = ctrl+`        (macOS: a system-wide key that drops a terminal from the top)
+//!   paste-warning = true | false   (ask before pasting several lines into a shell)
+//!   background-opacity = 1.0       (macOS: 0.3 .. 1.0; below 1 the desktop shows through)
+//!   background-blur = true | false (macOS: blur what shows through)
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::time::SystemTime;
 
 pub struct Config {
     pub light: bool,
@@ -39,6 +44,9 @@ pub struct Config {
     pub restore: bool,
     /// Modifier bits and key name of the quick-terminal hotkey.
     pub quick_terminal: Option<(u8, String)>,
+    pub paste_warning: bool,
+    pub opacity: f32,
+    pub blur: bool,
 }
 
 pub const FOREGROUND: usize = 16;
@@ -59,7 +67,7 @@ pub struct Keybind {
 pub const ACTIONS: &[&str] = &[
     "copy", "paste", "copy-output", "new-tab", "new-window", "close", "split-right", "split-down", "find", "clear",
     "zoom-in", "zoom-out", "zoom-reset", "next-tab", "prev-tab", "next-pane", "prev-pane", "prev-prompt", "next-prompt",
-    "toggle-zoom", "record", "update",
+    "toggle-zoom", "record", "update", "reopen-tab", "settings", "open-link",
 ];
 
 const DEFAULT: Config = Config {
@@ -76,6 +84,9 @@ const DEFAULT: Config = Config {
     term: None,
     restore: true,
     quick_terminal: None,
+    paste_warning: true,
+    opacity: 1.0,
+    blur: false,
 };
 
 /// "#rrggbb" or "rrggbb".
@@ -172,6 +183,9 @@ pub fn parse(text: &str) -> Config {
             "keybind" => c.keybinds.extend(keybind(value)),
             "restore" => c.restore = value != "false",
             "quick-terminal" => c.quick_terminal = keybind(&format!("{value} = none")).map(|k| (k.mods, k.key)),
+            "paste-warning" => c.paste_warning = value != "false",
+            "background-opacity" => c.opacity = value.parse::<f32>().map_or(1.0, |o| o.clamp(0.3, 1.0)),
+            "background-blur" => c.blur = value == "true",
             "term" if !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c)) => c.term = Some(value.to_string()),
             _ => {}
         }
@@ -179,9 +193,93 @@ pub fn parse(text: &str) -> Config {
     c
 }
 
+static CONFIG: AtomicPtr<Config> = AtomicPtr::new(std::ptr::null_mut());
+/// Modification time of the file when it was last read.
+static STAMP: Mutex<Option<SystemTime>> = Mutex::new(None);
+
+fn mtime() -> Option<SystemTime> {
+    std::fs::metadata(path()?).ok()?.modified().ok()
+}
+
+/// Read the file. Each load is leaked: loads happen at startup and when the user changes settings.
+fn load() -> *mut Config {
+    *STAMP.lock().unwrap() = mtime();
+    Box::into_raw(Box::new(path().and_then(|p| std::fs::read_to_string(p).ok()).map_or(DEFAULT, |t| parse(&t))))
+}
+
 pub fn get() -> &'static Config {
-    static CONFIG: OnceLock<Config> = OnceLock::new();
-    CONFIG.get_or_init(|| path().and_then(|p| std::fs::read_to_string(p).ok()).map_or(DEFAULT, |t| parse(&t)))
+    let mut p = CONFIG.load(Ordering::Acquire);
+    if p.is_null() {
+        let fresh = load();
+        p = match CONFIG.compare_exchange(std::ptr::null_mut(), fresh, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => fresh,
+            Err(first) => first,
+        };
+    }
+    // SAFETY: the pointer came from Box::into_raw and is never freed.
+    unsafe { &*p }
+}
+
+/// Re-read the file if it changed since the last read; true when it did.
+pub fn reload() -> bool {
+    if mtime() == *STAMP.lock().unwrap() {
+        return false;
+    }
+    CONFIG.store(load(), Ordering::Release);
+    true
+}
+
+/// The value of `key` as written in the file (e.g. "auto" for the theme), if set.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn value(key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path()?).ok()?;
+    text.lines().find_map(|l| {
+        let (k, v) = strip_comment(l).split_once('=')?;
+        (k.trim() == key).then(|| v.trim().trim_matches('"').to_string())
+    })
+}
+
+/// Where the file is, created (empty) if missing so it can be opened in an editor.
+pub fn file() -> Option<PathBuf> {
+    let p = path()?;
+    if !p.exists() {
+        std::fs::create_dir_all(p.parent()?).ok()?;
+        std::fs::write(&p, "# litty settings: https://github.com/stawan15/litty#config\n").ok()?;
+    }
+    Some(p)
+}
+
+/// Write `key = value` into the file (replacing the key's line, else appending), then reload.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn set(key: &str, value: &str) {
+    let Some(p) = file() else { return };
+    let text = std::fs::read_to_string(&p).unwrap_or_default();
+    if std::fs::write(&p, set_in(&text, key, value)).is_ok() {
+        // The same second as the last read would look unchanged: force it.
+        *STAMP.lock().unwrap() = None;
+        reload();
+    }
+}
+
+/// `text` with `key`'s first line set to `value`, or the line added; comments are kept.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn set_in(text: &str, key: &str, value: &str) -> String {
+    let line = format!("{key} = {value}");
+    let mut done = false;
+    let mut out: Vec<String> = text
+        .lines()
+        .map(|l| match strip_comment(l).split_once('=') {
+            Some((k, _)) if !done && k.trim() == key => {
+                done = true;
+                line.clone()
+            }
+            _ => l.to_string(),
+        })
+        .collect();
+    if !done {
+        out.push(line);
+    }
+    out.join("\n") + "\n"
 }
 
 #[cfg(test)]
@@ -204,5 +302,13 @@ mod tests {
         let k = |mods, key: &str, action: Option<&str>| Keybind { mods, key: key.into(), action: action.map(Into::into) };
         use crate::kitty::{ALT, CTRL, SHIFT, SUPER};
         assert_eq!(c.keybinds, vec![k(CTRL | SHIFT, "t", Some("new-tab")), k(SUPER, "d", None), k(ALT, "+", Some("zoom-in"))]);
+    }
+
+    #[test]
+    fn settings_are_written_in_place() {
+        let text = "# mine\ntheme = dark # night\nfont-size = 12\n";
+        assert_eq!(set_in(text, "theme", "light"), "# mine\ntheme = light\nfont-size = 12\n");
+        assert_eq!(set_in(text, "cursor", "bar"), format!("{text}cursor = bar\n"));
+        assert_eq!(set_in("", "tray", "false"), "tray = false\n");
     }
 }

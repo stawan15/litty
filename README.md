@@ -29,10 +29,13 @@ A small, fast terminal for macOS and Linux. Zero config: no settings file.
 
     cargo run --release            # login shell
     cargo run --release -- -e cmd  # run a command instead
+    litty img photo.jpg            # show pictures in the terminal you're in
 
 ## Configuration (optional)
 
-litty needs no configuration. To change a default, create `~/.config/litty/config`
+litty needs no configuration. On macOS, **litty → Settings…** (Cmd+,) changes the common
+settings with native controls; on Linux, Ctrl+Shift+, (or Settings… in the right-click menu)
+opens the file in your editor. The file is `~/.config/litty/config`
 (`$XDG_CONFIG_HOME/litty/config`), one `key = value` per line, `#` for comments:
 
     theme = dark          # dark | light | auto (auto follows the system appearance at startup)
@@ -48,10 +51,15 @@ litty needs no configuration. To change a default, create `~/.config/litty/confi
     restore = true        # reopen the tabs, splits and folders open at Quit
     quick-terminal = ctrl+`   # macOS: a system-wide key that drops a terminal from the top
     term = xterm-litty    # TERM for programs (default xterm-256color; see below)
+    paste-warning = true  # ask before pasting several lines into a shell
+    background-opacity = 1.0   # macOS: 0.3 … 1.0; below 1 the desktop shows through
+    background-blur = false    # macOS: blur what shows through
 
 Keybind actions: copy, paste, copy-output, new-tab, new-window, close, split-right, split-down,
 find, clear, zoom-in, zoom-out, zoom-reset, next-tab, prev-tab, next-pane, prev-pane,
-prev-prompt, next-prompt, toggle-zoom, record, update. Changes apply the next time litty starts.
+prev-prompt, next-prompt, toggle-zoom, record, update, reopen-tab, settings, open-link.
+Changes apply as soon as litty's window is back in front (colours already on screen and in the
+scrollback follow the new theme); `quick-terminal` applies at the next start.
 
 `term = xterm-litty` tells programs about litty's extras (undercurl, truecolor, synchronized
 output) through its own terminfo entry, installed with the packages and the app. TERM stays
@@ -67,8 +75,10 @@ mouse reporting (SGR), bracketed paste, focus events (1004), synchronized output
 OSC 7/8/52/133, notifications (OSC 9, OSC 777), colour queries (OSC 4/10/11/12), DECRQM, DSR,
 XTWINOPS size reports, alternate screen, scrollback with reflow.
 
-- **Images:** the Kitty graphics protocol (PNG, RGB, RGBA; inline, file or temporary file),
-  as used by `kitten icat`, chafa, timg, yazi and image.nvim. Images scroll with their text and
+- **Images:** `litty img photo.jpg` shows PNG and JPEG pictures right in the terminal, no other
+  tools needed (fitted to the window, turned upright by EXIF, works over ssh when the remote end
+  has litty). Underneath is the Kitty graphics protocol (PNG, RGB, RGBA; inline, file or
+  temporary file), so `kitten icat`, chafa, timg, yazi and image.nvim work too. Images scroll with their text and
   each pane keeps at most 64 MB of them. Not yet: sixel, shared memory, Unicode placeholders.
 - **Kitty keyboard protocol** (all five enhancement flags), so neovim, helix and fish can tell
   Ctrl+I from Tab, see key releases and so on.
@@ -122,6 +132,13 @@ quit. When nothing is happening it stays still and costs no CPU.
   matches appear as ticks. Click or drag it to jump.
 - **Find** (Cmd+F): highlights every match, Enter / Shift+Enter to step, Esc to close.
 - **Links:** hold Cmd (Ctrl on Linux) and click a URL.
+- **Right-click menu:** Copy, Paste, Open Link, Split, Clear, Reopen Closed Tab, Settings
+  (native on macOS).
+- **Drag and drop:** drop files on the window to type their paths, escaped for the shell.
+- **Safe paste:** pasting several lines into a shell without bracketed paste asks first
+  (Enter pastes, Esc cancels), and a pasted "end of paste" sequence can't break out of it.
+- **Progress:** programs that report progress (OSC 9;4: winget, systemd, newer cargo) get a thin
+  bar along the top of the pane and a percentage on the Dock icon.
 - **Maple Mono NF** (rounded, with Nerd Font icons and powerline glyphs) is used automatically when installed in `~/Library/Fonts`, `~/.local/share/fonts` or `~/.fonts`, or a folder inside them (files `MapleMono-NF-{Regular,Bold,Italic,BoldItalic}.ttf`, SIL OFL); otherwise Menlo / DejaVu Sans Mono.
 - **Nerd Font icons** work with any font: litty has Symbols Nerd Font Mono (MIT) built in, and draws powerline arrows to fill the cell.
 - Correct Thai (tone marks and vowels stack on the base letter), procedural box drawing,
@@ -133,6 +150,8 @@ quit. When nothing is happening it stays still and costs no CPU.
 | --- | --- |
 | Cmd+C / Cmd+V | Copy selection / paste (Ctrl+Shift on Linux) |
 | Cmd+T / Cmd+W | New tab / close pane or tab (Ctrl+Shift+T / W on Linux) |
+| Cmd+Shift+T | Reopen the closed tab, with its splits and folders (right-click menu on Linux) |
+| Cmd+, | Settings (Ctrl+Shift+, on Linux) |
 | Cmd+Shift+[ / ] , Ctrl+Tab | Previous / next tab |
 | Cmd+1 … 8, Cmd+9 | Go to tab N / last tab (Alt+N on Linux) |
 | Cmd+D / Cmd+Shift+D | Split right / down (Ctrl+Shift+O / E on Linux) |

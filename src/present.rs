@@ -69,6 +69,8 @@ mod mac {
         stale: Vec<Option<(usize, usize)>>,
         shown: usize,
         size: (usize, usize),
+        /// False while the background is see-through (config `background-opacity`).
+        opaque: bool,
     }
 
     impl Presenter {
@@ -84,7 +86,7 @@ mod mac {
             layer.setOpaque(true);
             layer.setContentsGravity(unsafe { kCAGravityTopLeft });
             root.addSublayer(&layer);
-            Presenter { window: window.clone(), layer, surfaces: Vec::new(), stale: Vec::new(), shown: 0, size: (0, 0) }
+            Presenter { window: window.clone(), layer, surfaces: Vec::new(), stale: Vec::new(), shown: 0, size: (0, 0), opaque: true }
         }
 
         pub fn resize(&mut self, w: usize, h: usize) {
@@ -131,6 +133,16 @@ mod mac {
             let s = &self.surfaces[i];
             let (w, stride) = (self.size.0, s.bytes_per_row() / 4);
             let (r0, r1) = self.stale[i].take().unwrap_or((0, 0));
+            // Below full opacity the background colour becomes see-through (premultiplied alpha).
+            let opacity = crate::config::get().opacity;
+            if self.opaque != (opacity >= 1.0) {
+                self.opaque = opacity >= 1.0;
+                self.layer.setOpaque(self.opaque);
+            }
+            let bg = crate::grid::def_bg();
+            let a = (opacity * 255.0).round() as u32;
+            let premul = |shift: u32| ((bg >> shift & 255) * a / 255) << shift;
+            let clear_bg = if self.opaque { bg | 0xFF00_0000 } else { a << 24 | premul(16) | premul(8) | premul(0) };
             // SAFETY: the surface is locked while we write `w` words in each of rows r0..r1 (< height).
             // The framebuffer's alpha byte is 0, so it is set here (else the layer blends with what is behind it).
             unsafe {
@@ -138,8 +150,15 @@ mod mac {
                 let dst = s.base_address().as_ptr() as *mut u32;
                 for y in r0..r1 {
                     let out = std::slice::from_raw_parts_mut(dst.add(y * stride), w);
-                    for (o, &px) in out.iter_mut().zip(&fb[y * w..(y + 1) * w]) {
-                        *o = px | 0xFF00_0000;
+                    let row = &fb[y * w..(y + 1) * w];
+                    if self.opaque {
+                        for (o, &px) in out.iter_mut().zip(row) {
+                            *o = px | 0xFF00_0000;
+                        }
+                    } else {
+                        for (o, &px) in out.iter_mut().zip(row) {
+                            *o = if px == bg { clear_bg } else { px | 0xFF00_0000 };
+                        }
                     }
                 }
                 s.unlock(IOSurfaceLockOptions::empty(), std::ptr::null_mut());
