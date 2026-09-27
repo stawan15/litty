@@ -9,6 +9,7 @@ mod macos;
 mod present;
 mod record;
 mod render;
+mod session;
 mod thai;
 mod theme;
 mod update;
@@ -278,6 +279,8 @@ enum Want {
     Tab(Option<String>),
     /// A new independent window.
     Window(Option<String>),
+    /// Quit litty, keeping the session for the next launch (Ctrl+Shift+Q on Linux).
+    Quit,
 }
 
 /// One window: on macOS exactly one tab (native tabs are separate windows), elsewhere it draws its own tab bar.
@@ -1003,17 +1006,67 @@ impl Win {
 
     /// Split the focused pane: `vertical` puts the new pane to its right, otherwise below.
     fn split(&mut self, vertical: bool) {
-        let cwd = self.current_dir();
-        let Some(pane) = self.spawn_pane(&[], cwd.as_deref()) else { return };
+        let (target, cwd) = (self.tab().active, self.current_dir());
+        if let Some(new_id) = self.split_pane(target, vertical, cwd.as_deref(), 0.5) {
+            self.relayout();
+            self.focus_pane(new_id);
+        }
+    }
+
+    /// Split pane `target` of the current tab, giving it `ratio` of the space; returns the new pane.
+    fn split_pane(&mut self, target: usize, vertical: bool, cwd: Option<&str>, ratio: f32) -> Option<usize> {
+        let pane = self.spawn_pane(&[], cwd)?;
         let new_id = pane.id;
         let tab = &mut self.tabs[self.active];
         tab.zoom = false;
-        if !tab.root.split(tab.active, vertical, new_id) {
-            return;
+        if !tab.root.split(target, vertical, new_id) {
+            return None;
+        }
+        let path = tab.root.path_to(target)?;
+        if let Some(Node::Split { ratio: r, .. }) = tab.root.node_at_mut(&path[..path.len() - 1]) {
+            *r = ratio;
         }
         tab.panes.push(pane);
+        Some(new_id)
+    }
+
+    /// The tabs of this window for the session file.
+    fn session_tabs(&self, group: usize) -> Vec<session::TabState> {
+        fn layout(node: &Node, tab: &Tab) -> session::Layout {
+            match node {
+                Node::Leaf(id) => session::Layout::Pane(tab.panes.iter().find(|p| p.id == *id).and_then(|p| p.term.lock().unwrap().grid.cwd.clone())),
+                Node::Split { vertical, ratio, a, b } => session::Layout::Split { vertical: *vertical, ratio: *ratio, a: Box::new(layout(a, tab)), b: Box::new(layout(b, tab)) },
+            }
+        }
+        self.tabs
+            .iter()
+            .map(|tab| {
+                let mut leaves = Vec::new();
+                tab.root.leaves(&mut leaves);
+                let active = leaves.iter().position(|&id| id == tab.active).unwrap_or(0);
+                session::TabState { group, active, layout: layout(&tab.root, tab) }
+            })
+            .collect()
+    }
+
+    /// Rebuild a saved tab's splits in the current tab (which holds one pane) and focus its pane.
+    fn restore_tab(&mut self, saved: &session::TabState) {
+        fn build(win: &mut Win, node: &session::Layout, target: usize) {
+            if let session::Layout::Split { vertical, ratio, a, b } = node {
+                if let Some(new_id) = win.split_pane(target, *vertical, b.first_dir(), *ratio) {
+                    build(win, a, target);
+                    build(win, b, new_id);
+                }
+            }
+        }
+        let first = self.tab().active;
+        build(self, &saved.layout, first);
         self.relayout();
-        self.focus_pane(new_id);
+        let mut leaves = Vec::new();
+        self.tab().root.leaves(&mut leaves);
+        if let Some(&id) = leaves.get(saved.active) {
+            self.focus_pane(id);
+        }
     }
 
     /// Reset per-pane interaction state (selection, mouse, find) when focus moves.
@@ -1299,6 +1352,7 @@ impl Win {
             "r" if shift => self.toggle_recording(),
             "k" => self.clear_screen(),
             "n" => self.new_window(),
+            "q" if !cfg!(target_os = "macos") => self.want = Some(Want::Quit),
             "u" if shift => self.toggle_update_prompt(),
             "f" => self.start_find(),
             "t" => self.open_tab(),
@@ -2098,6 +2152,8 @@ struct App {
     last_focus: Option<WindowId>,
     /// Programs' own notifications (OSC 9 / 777) are held back until then, so a loop can't flood.
     alert_after: Instant,
+    /// Quit was chosen (the session is saved): closing the windows must not clear it.
+    quitting: bool,
     #[cfg(target_os = "macos")]
     tray: Option<macos::Tray>,
     /// The tray is wanted but not made yet; it is made shortly after the first frame, because
@@ -2139,6 +2195,7 @@ impl App {
                 match want {
                     Want::Tab(cwd) => self.add_window(el, &[], cwd, Some(id)),
                     Want::Window(cwd) => self.add_window(el, &[], cwd, None),
+                    Want::Quit => self.quit(),
                 }
             }
         }
@@ -2259,6 +2316,79 @@ impl App {
         next.into_iter().chain(running.filter(|&t| t > now)).chain(done.map(|d| d.1)).min()
     }
 
+    /// Save the session, then close every window (the app exits when the last one goes).
+    fn quit(&mut self) {
+        self.save_session();
+        self.quitting = true;
+        let ids: Vec<WindowId> = self.wins.keys().copied().collect();
+        for id in ids {
+            self.close_window(id);
+        }
+    }
+
+    fn save_session(&self) {
+        if !config::get().restore || !self.initial_command.is_empty() {
+            return;
+        }
+        // Order windows (and on macOS the native tabs within a group) as they appear.
+        let mut wins: Vec<((usize, usize), &Win)> = self
+            .wins
+            .values()
+            .map(|w| {
+                #[cfg(target_os = "macos")]
+                let place = w.window.as_deref().map_or((0, 0), macos::tab_position);
+                #[cfg(not(target_os = "macos"))]
+                let place = (w.window.as_ref().map_or(0, |w| u64::from(w.id()) as usize), 0);
+                (place, w)
+            })
+            .collect();
+        wins.sort_by_key(|(place, _)| *place);
+        let mut groups = Vec::new();
+        let tabs: Vec<session::TabState> = wins
+            .iter()
+            .flat_map(|((group, _), w)| {
+                let n = groups.iter().position(|g| g == group).unwrap_or_else(|| {
+                    groups.push(*group);
+                    groups.len() - 1
+                });
+                w.session_tabs(n)
+            })
+            .collect();
+        session::save(&tabs);
+    }
+
+    /// Reopen the session saved at the last Quit; false if there was none.
+    fn restore_session(&mut self, el: &ActiveEventLoop) -> bool {
+        let saved = session::take();
+        if saved.is_empty() {
+            return false;
+        }
+        // The window each group became: tabs of a group join it (a native tab on macOS).
+        let mut group_win: Vec<(usize, WindowId)> = Vec::new();
+        for tab in &saved {
+            let dir = tab.layout.first_dir().map(String::from);
+            let joined = group_win.iter().find(|(g, _)| *g == tab.group).map(|(_, id)| *id);
+            let id = match joined {
+                #[cfg(not(target_os = "macos"))]
+                Some(id) => {
+                    let Some(w) = self.wins.get_mut(&id) else { continue };
+                    w.new_tab(&[], dir);
+                    id
+                }
+                join => {
+                    self.add_window(el, &[], dir, join);
+                    let Some(id) = self.last_focus else { continue };
+                    group_win.push((tab.group, id));
+                    id
+                }
+            };
+            if let Some(w) = self.wins.get_mut(&id) {
+                w.restore_tab(tab);
+            }
+        }
+        !self.wins.is_empty()
+    }
+
     fn close_window(&mut self, id: WindowId) {
         if let Some(mut w) = self.wins.remove(&id) {
             w.shutdown();
@@ -2278,7 +2408,9 @@ impl ApplicationHandler<Ev> for App {
         #[cfg(target_os = "macos")]
         el.set_allows_automatic_window_tabbing(false);
         let command = self.initial_command.clone();
-        self.add_window(el, &command, None, None);
+        if !command.is_empty() || !config::get().restore || !self.restore_session(el) {
+            self.add_window(el, &command, None, None);
+        }
         if command.is_empty() && update::enabled() {
             let proxy = self.proxy.clone();
             std::thread::spawn(move || update::check(false, |e| drop(proxy.send_event(Ev::Update(e)))));
@@ -2371,12 +2503,7 @@ impl ApplicationHandler<Ev> for App {
                             }
                         }
                     }
-                    macos::TrayAction::Quit => {
-                        let ids: Vec<WindowId> = self.wins.keys().copied().collect();
-                        for id in ids {
-                            self.close_window(id);
-                        }
-                    }
+                    macos::TrayAction::Quit => self.quit(),
                 }
                 self.settle(el, None);
             }
@@ -2387,6 +2514,13 @@ impl ApplicationHandler<Ev> for App {
         let last = self.last_focus.and_then(|id| self.wins.get(&id)).or_else(|| self.wins.values().next());
         if let Some(w) = last {
             w.save_state();
+        }
+        // Quitting with windows open (Cmd+Q) keeps them for next time; closing the last window
+        // by hand starts fresh. `litty -e cmd` runs leave the saved session alone.
+        if !self.wins.is_empty() {
+            self.save_session();
+        } else if !self.quitting && self.initial_command.is_empty() {
+            session::clear();
         }
         let staged = match &self.ui.borrow().state {
             update::State::Staged(_, path) => Some(path.clone()),
@@ -2445,6 +2579,7 @@ fn main() {
         ui: Rc::new(RefCell::new(UpdateUi::default())),
         last_focus: None,
         alert_after: Instant::now(),
+        quitting: false,
         #[cfg(target_os = "macos")]
         tray: None,
         #[cfg(target_os = "macos")]

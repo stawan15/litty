@@ -14,6 +14,24 @@ fn ns_window(w: &Window) -> Option<Retained<AnyObject>> {
     unsafe { msg_send![view, window] }
 }
 
+/// (group, position) of a window among the system's native tabs: windows in one tab group share
+/// `group`, and `position` is the tab's place in its bar.
+pub fn tab_position(w: &Window) -> (usize, usize) {
+    let Some(win) = ns_window(w) else { return (0, 0) };
+    let me = Retained::as_ptr(&win) as usize;
+    // SAFETY: plain NSWindow / NSArray messages on the main thread.
+    unsafe {
+        let tabs: Option<Retained<AnyObject>> = msg_send![&*win, tabbedWindows];
+        let Some(tabs) = tabs else { return (me, 0) };
+        let n: usize = msg_send![&*tabs, count];
+        let at = |i: usize| -> usize {
+            let o: *mut AnyObject = msg_send![&*tabs, objectAtIndex: i];
+            o as usize
+        };
+        ((0..n).map(at).min().unwrap_or(me), (0..n).position(|i| at(i) == me).unwrap_or(0))
+    }
+}
+
 /// Add `new` as a tab of the window `existing` belongs to, and show it.
 pub fn add_tab(existing: &Window, new: &Window) {
     let (Some(a), Some(b)) = (ns_window(existing), ns_window(new)) else { return };

@@ -617,6 +617,7 @@ impl Grid {
     }
 
     /// When the command that is still running (OSC 133 C without D yet) started.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn running_since(&self) -> Option<Instant> {
         self.marks.back().filter(|m| m.end.is_none()).and_then(|m| m.started)
     }
