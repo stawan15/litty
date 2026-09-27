@@ -259,6 +259,8 @@ pub struct Fonts {
     /// The built-in Nerd Font icons, parsed on first use.
     symbols: Option<Option<Face>>,
     next_fallback: usize,
+    /// How many of fontconfig's finds (`FC_FOUND`) are in `fallbacks`.
+    fc_loaded: usize,
     px: f32,
     ascii: [Vec<Option<Glyph>>; 4],
     other: HashMap<(char, u8), Glyph>,
@@ -290,6 +292,7 @@ impl Fonts {
             fallbacks: Vec::new(),
             symbols: None,
             next_fallback: 0,
+            fc_loaded: 0,
             px,
             ascii: std::array::from_fn(|_| (0..128).map(|_| None).collect()),
             other: HashMap::new(),
@@ -388,8 +391,45 @@ impl Fonts {
                 }
             }
         }
+        // Fonts fontconfig found earlier (maybe at another zoom level), then ask it about `ch`.
+        let found = fc_found().lock().unwrap().clone();
+        for path in found[self.fc_loaded..].iter().copied().chain(std::iter::from_fn(|| fc_lookup(ch)).take(1)) {
+            self.fc_loaded += 1;
+            if let Some(f) = Face::load(path, 0, px) {
+                let hit = f.has(ch);
+                self.fallbacks.push(f);
+                if hit {
+                    return self.fallbacks.last().unwrap().rasterize(ch, bold);
+                }
+            }
+        }
         self.faces[0].as_ref().unwrap().rasterize(ch, false)
     }
+}
+
+/// Font files fontconfig suggested this run, in the order found.
+fn fc_found() -> &'static Mutex<Vec<&'static str>> {
+    static FOUND: OnceLock<Mutex<Vec<&'static str>>> = OnceLock::new();
+    FOUND.get_or_init(Default::default)
+}
+
+/// Ask fontconfig (`fc-match`) for a font that has `ch`, for scripts the built-in list misses
+/// (CJK, Indic, …). Each ask is a process, so there are at most 32 per run, and a font that was
+/// already suggested (and so lacks `ch`) is not returned again.
+fn fc_lookup(ch: char) -> Option<&'static str> {
+    static LEFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(32);
+    if ch.is_control() || is_private_use(ch) || LEFT.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| n.checked_sub(1)).is_err() {
+        return None;
+    }
+    let out = std::process::Command::new("fc-match").args(["-f", "%{file}", &format!(":charset={:x}", ch as u32)]).output().ok()?;
+    let path = String::from_utf8(out.stdout).ok().filter(|p| p.ends_with(".ttf") || p.ends_with(".otf") || p.ends_with(".ttc"))?;
+    let mut found = fc_found().lock().unwrap();
+    if found.contains(&path.as_str()) {
+        return None;
+    }
+    let path: &'static str = Box::leak(path.into_boxed_str());
+    found.push(path);
+    Some(path)
 }
 
 #[cfg(test)]
