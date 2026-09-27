@@ -56,10 +56,12 @@ answered as "no enhancements").
 
 litty checks for a newer release when it starts, at most once an hour (a single request to GitHub; turn it off with
 `LITTY_NO_UPDATE_CHECK=1`). When one exists a small `↑ litty x.y.z` notice appears in the corner of the
-window. Press Cmd+Shift+U (Ctrl+Shift+U on Linux) to open it: Enter downloads the release in the
-background and installs it when you quit, Esc skips that version. Downloads are verified with an
-ed25519 signature before anything is replaced. If a package manager installed litty (Homebrew, apt,
-Nix, cargo), the notice shows the command to run instead and Enter copies it.
+window. Click it or press Cmd+Shift+U (Ctrl+Shift+U on Linux) to open it: Enter downloads the release in the
+background and installs it when you quit, Esc skips that version. If litty came from the .deb or .rpm,
+Enter downloads the new package and installs it right away (the system asks for your password), and
+the next launch runs it. Downloads are verified with an ed25519 signature before anything is replaced.
+If another package manager installed litty (Homebrew, Nix, cargo), the notice shows the command to
+run instead and Enter copies it.
 
 On macOS a small hamster sits in the menu bar. It runs in its wheel while a command is running in
 any tab (zsh, or any shell that emits OSC 133), and stuffs its cheeks while an update downloads; a
@@ -93,7 +95,8 @@ quit. When nothing is happening it stays still and costs no CPU.
   matches appear as ticks. Click or drag it to jump.
 - **Find** (Cmd+F): highlights every match, Enter / Shift+Enter to step, Esc to close.
 - **Links:** hold Cmd (Ctrl on Linux) and click a URL.
-- **Maple Mono NF** (rounded, with Nerd Font icons and powerline glyphs) is used automatically when installed in `~/Library/Fonts`, `~/.local/share/fonts` or `~/.fonts` (files `MapleMono-NF-{Regular,Bold,Italic,BoldItalic}.ttf`, SIL OFL); otherwise Menlo / DejaVu Sans Mono.
+- **Maple Mono NF** (rounded, with Nerd Font icons and powerline glyphs) is used automatically when installed in `~/Library/Fonts`, `~/.local/share/fonts` or `~/.fonts`, or a folder inside them (files `MapleMono-NF-{Regular,Bold,Italic,BoldItalic}.ttf`, SIL OFL); otherwise Menlo / DejaVu Sans Mono.
+- **Nerd Font icons** work with any font: litty has Symbols Nerd Font Mono (MIT) built in, and draws powerline arrows to fill the cell.
 - Correct Thai (tone marks and vowels stack on the base letter), procedural box drawing,
   bold/italic/underline, truecolor, 20k lines of compact scrollback.
 

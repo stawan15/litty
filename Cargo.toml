@@ -8,7 +8,7 @@ repository = "https://github.com/stawan15/litty"
 readme = "README.md"
 keywords = ["terminal", "terminal-emulator", "tty", "pty"]
 categories = ["command-line-utilities"]
-include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+include = ["src/**", "assets/thai-words.bin", "assets/SymbolsNerdFont*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [[bin]]
 name = "litty"
@@ -25,7 +25,7 @@ maintainer = "stawan15"
 section = "utils"
 extended-description = "Zero config: tabs and splits, scrollback with reflow, ligatures, command blocks and Thai support."
 priority = "optional"
-depends = "$auto"
+depends = "$auto, curl"
 assets = [
     ["target/release/litty", "usr/bin/", "755"],
     ["packaging/litty.desktop", "usr/share/applications/", "644"],

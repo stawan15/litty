@@ -68,7 +68,7 @@ jobs:
           merge-multiple: true
       - name: Sign artifacts for the self-updater
         if: env.LITTY_SIGNING_KEY != ''
-        run: cargo run --release --example sign -- artifacts/*.dmg artifacts/*.tar.gz
+        run: cargo run --release --example sign -- artifacts/*.dmg artifacts/*.tar.gz artifacts/*.deb artifacts/*.rpm
       - name: Checksums and manifests
         run: |
           VERSION=${GITHUB_REF_NAME#v}

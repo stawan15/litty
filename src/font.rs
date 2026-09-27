@@ -9,6 +9,16 @@ struct Family {
     index: [u32; 4],
 }
 
+/// The directory holding `name`: `dir` itself or a folder up to `depth` levels below it (font
+/// installers often unpack into a subfolder such as `fonts/MapleMono-NF/`).
+fn find_font(dir: &std::path::Path, name: &str, depth: u32) -> Option<std::path::PathBuf> {
+    if dir.join(name).exists() {
+        return Some(dir.to_path_buf());
+    }
+    let entries = std::fs::read_dir(dir).ok().filter(|_| depth > 0)?;
+    entries.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).find_map(|e| find_font(&e.path(), name, depth - 1))
+}
+
 /// Maple Mono NF (a rounded monospace font with Nerd Font icons) if installed in a user font
 /// directory; it is preferred over the system fonts below.
 fn user_family() -> Option<&'static Family> {
@@ -17,8 +27,8 @@ fn user_family() -> Option<&'static Family> {
         let home = std::env::var("HOME").ok()?;
         let dir = ["Library/Fonts", ".local/share/fonts", ".fonts"]
             .iter()
-            .map(|d| format!("{home}/{d}"))
-            .find(|d| std::path::Path::new(&format!("{d}/MapleMono-NF-Regular.ttf")).exists())?;
+            .find_map(|d| find_font(&std::path::Path::new(&home).join(d), "MapleMono-NF-Regular.ttf", 2))?;
+        let dir = dir.display();
         // Leaked once: the paths live for the whole run.
         let path = |style: &str| -> &'static str { Box::leak(format!("{dir}/MapleMono-NF-{style}.ttf").into_boxed_str()) };
         Some(Family { files: [path("Regular"), path("Bold"), path("Italic"), path("BoldItalic")], index: [0; 4] })
@@ -80,6 +90,15 @@ const FALLBACK: &[&str] = &[
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 ];
 
+/// Nerd Font icons (Symbols Nerd Font Mono, MIT), so prompts and file listings that use them work
+/// with any primary font. Built in: the pages are only read from the binary once an icon is drawn.
+static SYMBOLS: &[u8] = include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf");
+
+/// Nerd Font icons live in the Unicode private use areas.
+fn is_private_use(ch: char) -> bool {
+    matches!(ch, '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..)
+}
+
 /// Placement of a rasterized glyph relative to the pen on the baseline.
 pub struct Metrics {
     pub xmin: i32,
@@ -119,7 +138,10 @@ struct Face {
 
 impl Face {
     fn load(path: &str, index: u32, px: f32) -> Option<Face> {
-        let data = font_data(path)?;
+        Face::from_data(font_data(path)?, index, px)
+    }
+
+    fn from_data(data: &'static [u8], index: u32, px: f32) -> Option<Face> {
         let font = FontRef::try_from_slice_and_index(data, index).ok()?;
         // `px` is the em size; PxScale is the ascent-to-descent height.
         let scale = PxScale::from(px * font.height_unscaled() / font.units_per_em()?);
@@ -174,6 +196,8 @@ pub struct Fonts {
     faces: [Option<Face>; 4],
     tried: [bool; 4],
     fallbacks: Vec<Face>,
+    /// The built-in Nerd Font icons, parsed on first use.
+    symbols: Option<Option<Face>>,
     next_fallback: usize,
     px: f32,
     ascii: [Vec<Option<Glyph>>; 4],
@@ -203,6 +227,7 @@ impl Fonts {
             faces: [Some(regular), None, None, None],
             tried: [true, false, false, false],
             fallbacks: Vec::new(),
+            symbols: None,
             next_fallback: 0,
             px,
             ascii: std::array::from_fn(|_| (0..128).map(|_| None).collect()),
@@ -283,6 +308,11 @@ impl Fonts {
         if face.has(ch) {
             return face.rasterize(ch, bold && !genuine);
         }
+        if is_private_use(ch)
+            && let Some(f) = self.symbols.get_or_insert_with(|| Face::from_data(SYMBOLS, 0, px)).as_ref().filter(|f| f.has(ch))
+        {
+            return f.rasterize(ch, bold);
+        }
         if let Some(f) = self.fallbacks.iter().find(|f| f.has(ch)) {
             return f.rasterize(ch, bold);
         }
@@ -345,6 +375,16 @@ mod tests {
         // Depends on a Thai font (Ayuthaya on macOS) being installed; CI's Linux image has none.
         if cfg!(target_os = "macos") {
             assert_eq!(f.glyph('\u{0e48}', 0).m.advance_width, 0.0);
+        }
+    }
+
+    #[test]
+    fn nerd_font_icons_are_built_in() {
+        let mut f = Fonts::new(28.0);
+        let tofu = f.glyph('\u{10fffd}', 0).bmp.clone();
+        for icon in ['\u{f015}', '\u{e0b0}', '\u{f0219}'] {
+            let g = f.glyph(icon, 0);
+            assert!(g.m.width > 0 && g.bmp != tofu, "{:x} has no glyph", icon as u32);
         }
     }
 
