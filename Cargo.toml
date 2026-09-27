@@ -54,6 +54,7 @@ miniz_oxide = "0.8"
 unicode-width = "0.2.2"
 vte = "0.15.0"
 winit = "0.30.13"
+zune-jpeg = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
