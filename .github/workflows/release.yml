@@ -42,8 +42,9 @@ jobs:
           mkdir out
           d=litty-$VERSION-${{ matrix.target }}
           mkdir $d
-          cp target/release/litty README.md LICENSE packaging/litty.desktop packaging/litty.png $d/
+          cp target/release/litty README.md LICENSE packaging/litty.desktop packaging/litty.png packaging/litty.terminfo $d/
           tar -czf out/$d.tar.gz $d
+          tic -x -o target/terminfo packaging/litty.terminfo
           cargo deb --no-build --output out/
           cargo generate-rpm --output out/
       - uses: actions/upload-artifact@v4

@@ -11,6 +11,7 @@
 //!   scrollback = 20000             (lines kept per pane, up to 200000)
 //!   foreground = #c0caf5           (also background, selection, cursor-color, color0 .. color15)
 //!   keybind = ctrl+shift+t = new-tab   (`= none` passes the keys to the program instead)
+//!   term = xterm-litty             (TERM for programs; default xterm-256color)
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -32,6 +33,7 @@ pub struct Config {
     /// Colour overrides: 0..=15 are the ANSI colours, then FOREGROUND, BACKGROUND, SELECTION, CURSOR.
     pub colors: Vec<(usize, u32)>,
     pub keybinds: Vec<Keybind>,
+    pub term: Option<String>,
 }
 
 pub const FOREGROUND: usize = 16;
@@ -66,6 +68,7 @@ const DEFAULT: Config = Config {
     scrollback: 20_000,
     colors: Vec::new(),
     keybinds: Vec::new(),
+    term: None,
 };
 
 /// "#rrggbb" or "rrggbb".
@@ -160,6 +163,7 @@ pub fn parse(text: &str) -> Config {
                 }
             }
             "keybind" => c.keybinds.extend(keybind(value)),
+            "term" if !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c)) => c.term = Some(value.to_string()),
             _ => {}
         }
     }

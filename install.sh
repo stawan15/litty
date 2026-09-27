@@ -31,6 +31,8 @@ Linux)
   install -Dm755 "$tmp/$name/litty" "$HOME/.local/bin/litty"
   install -Dm644 "$tmp/$name/litty.desktop" "$HOME/.local/share/applications/litty.desktop"
   install -Dm644 "$tmp/$name/litty.png" "$HOME/.local/share/icons/hicolor/512x512/apps/litty.png"
+  # litty's terminfo (used with `term = xterm-litty`); tic ships with ncurses.
+  if command -v tic >/dev/null && [ -f "$tmp/$name/litty.terminfo" ]; then tic -x "$tmp/$name/litty.terminfo" 2>/dev/null || true; fi
   echo "Installed ~/.local/bin/litty (make sure ~/.local/bin is in your PATH)"
   ;;
 *)

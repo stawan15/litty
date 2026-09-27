@@ -467,8 +467,15 @@ fn spawn_shell(size: &Winsize, command: &[String], cwd: Option<&str>) -> Option<
         env.retain(|(ek, _)| ek != k);
         env.push((k.to_string(), v));
     };
-    set("TERM", "xterm-256color".into());
+    set("TERM", config::get().term.clone().unwrap_or_else(|| "xterm-256color".into()));
     set("COLORTERM", "truecolor".into());
+    set("TERM_PROGRAM", "litty".into());
+    set("TERM_PROGRAM_VERSION", update::VERSION.into());
+    // The app bundle carries litty's terminfo (xterm-litty); the trailing ':' keeps the system's.
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.parent()?.join("Resources/terminfo"))).filter(|d| d.is_dir()) {
+        let rest = std::env::var("TERMINFO_DIRS").unwrap_or_default();
+        set("TERMINFO_DIRS", format!("{}:{rest}", dir.display()));
+    }
     if std::env::var_os("LANG").is_none() {
         set("LANG", "en_US.UTF-8".into());
     }
