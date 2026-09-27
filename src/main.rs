@@ -362,13 +362,75 @@ if [[ -o interactive ]]; then
 fi
 "#;
 
-fn install_zsh_integration() -> Option<PathBuf> {
+/// The same for bash. litty starts it as `-bash --posix` with ENV pointing here: a POSIX-mode shell
+/// reads only $ENV, so this script leaves POSIX mode and reads the usual login files itself before
+/// adding the hooks. The command line comes from history in PS0 (bash 4.4+), and only when this
+/// line was saved (so HISTCONTROL=ignorespace never names the wrong command).
+const BASH_INTEGRATION: &str = r#"# litty shell integration (OSC 133 prompt marks).
+builtin set +o posix
+if [ -n "${LT_ORIG_ENV+x}" ]; then export ENV="$LT_ORIG_ENV"; else builtin unset ENV; fi
+builtin unset LT_ORIG_ENV
+[ -r /etc/profile ] && builtin source /etc/profile
+for __lt_f in ~/.bash_profile ~/.bash_login ~/.profile; do
+  [ -r "$__lt_f" ] && { builtin source "$__lt_f"; break; }
+done
+builtin unset __lt_f
+__lt_precmd() {
+  local s=$?
+  __lt_next=$HISTCMD
+  builtin printf '\e]133;D;%s\a\e]133;A\a\e]7;file://%s%s\a' "$s" "$HOSTNAME" "${PWD// /%20}"
+  return $s
+}
+__lt_preexec() {
+  local LC_ALL=C h s o= c i
+  h=$(HISTTIMEFORMAT= builtin history 1)
+  h=${h#"${h%%[![:space:]]*}"}
+  if [ "${h%%[![:digit:]]*}" = "$__lt_next" ]; then
+    s=${h#*[[:digit:]]  }
+    s=${s:0:200}
+    for (( i = 0; i < ${#s}; i++ )); do
+      c=${s:i:1}
+      case $c in [A-Za-z0-9._~/-]) o+=$c ;; *) builtin printf -v c '%%%02X' "'$c"; o+=$c ;; esac
+    done
+  fi
+  builtin printf '\e]133;C;cmdline_url=%s\a' "$o"
+}
+PROMPT_COMMAND="__lt_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+PS0='$(__lt_preexec)'"${PS0:-}"
+"#;
+
+/// The same for fish, found through XDG_DATA_DIRS as a vendor configuration snippet.
+const FISH_INTEGRATION: &str = r#"# litty shell integration (OSC 133 prompt marks).
+if set -q LT_ORIG_XDG_DATA_DIRS
+    if test -n "$LT_ORIG_XDG_DATA_DIRS"
+        set -gx XDG_DATA_DIRS $LT_ORIG_XDG_DATA_DIRS
+    else
+        set -e XDG_DATA_DIRS
+    end
+    set -e LT_ORIG_XDG_DATA_DIRS
+end
+if status is-interactive
+    function __lt_prompt --on-event fish_prompt
+        printf '\e]133;D;%s\a\e]133;A\a\e]7;file://%s%s\a' "$__lt_status" $hostname (string replace -a ' ' '%20' -- $PWD)
+    end
+    function __lt_preexec --on-event fish_preexec
+        printf '\e]133;C;cmdline_url=%s\a' (string escape --style=url -- (string sub -l 200 -- $argv[1]))
+    end
+    function __lt_postexec --on-event fish_postexec
+        set -g __lt_status $status
+    end
+end
+"#;
+
+/// Write a shell integration script to `<cache>/litty/<dir>/<file>`; returns that directory.
+fn install_integration(dir: &str, file: &str, script: &str) -> Option<PathBuf> {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    let dir = cache.join("litty/zsh");
-    std::fs::create_dir_all(&dir).ok()?;
-    std::fs::write(dir.join(".zshenv"), ZSH_INTEGRATION).ok()?;
+    let dir = cache.join("litty").join(dir);
+    let path = dir.join(file);
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    std::fs::write(path, script).ok()?;
     Some(dir)
 }
 
@@ -391,10 +453,10 @@ fn resolve_program(name: &str) -> Option<CString> {
 fn spawn_shell(size: &Winsize, command: &[String], cwd: Option<&str>) -> Option<(File, i32)> {
     let login = command.is_empty();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let (path, argv): (CString, Vec<CString>) = if login {
+    let name = shell.rsplit('/').next().unwrap_or("sh");
+    let (path, mut argv): (CString, Vec<CString>) = if login {
         // Login shell, like other terminals: argv[0] is "-name".
-        let name = format!("-{}", shell.rsplit('/').next().unwrap_or("sh"));
-        (CString::new(shell.clone()).ok()?, vec![CString::new(name).ok()?])
+        (CString::new(shell.clone()).ok()?, vec![CString::new(format!("-{name}")).ok()?])
     } else {
         (resolve_program(&command[0])?, command.iter().map(|a| CString::new(a.as_str()).ok()).collect::<Option<_>>()?)
     };
@@ -410,11 +472,32 @@ fn spawn_shell(size: &Winsize, command: &[String], cwd: Option<&str>) -> Option<
     if std::env::var_os("LANG").is_none() {
         set("LANG", "en_US.UTF-8".into());
     }
-    if login && shell.ends_with("/zsh") {
-        if let Some(dir) = install_zsh_integration() {
-            set("LT_ORIG_ZDOTDIR", std::env::var("ZDOTDIR").unwrap_or_default());
-            set("ZDOTDIR", dir.to_string_lossy().into_owned());
+    // Shell integration: the shell reports prompts and commands (OSC 133) for command blocks.
+    match name {
+        "zsh" if login => {
+            if let Some(dir) = install_integration("zsh", ".zshenv", ZSH_INTEGRATION) {
+                set("LT_ORIG_ZDOTDIR", std::env::var("ZDOTDIR").unwrap_or_default());
+                set("ZDOTDIR", dir.to_string_lossy().into_owned());
+            }
         }
+        "bash" if login => {
+            if let Some(dir) = install_integration("bash", "litty.bash", BASH_INTEGRATION) {
+                if let Ok(env) = std::env::var("ENV") {
+                    set("LT_ORIG_ENV", env);
+                }
+                set("ENV", dir.join("litty.bash").to_string_lossy().into_owned());
+                argv.push(CString::new("--posix").ok()?);
+            }
+        }
+        "fish" if login => {
+            if let Some(dir) = install_integration("fish", "fish/vendor_conf.d/litty.fish", FISH_INTEGRATION) {
+                let orig = std::env::var("XDG_DATA_DIRS").unwrap_or_default();
+                let rest = if orig.is_empty() { "/usr/local/share:/usr/share" } else { &orig };
+                set("XDG_DATA_DIRS", format!("{}:{rest}", dir.display()));
+                set("LT_ORIG_XDG_DATA_DIRS", orig);
+            }
+        }
+        _ => {}
     }
     let envp: Vec<CString> = env.iter().filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok()).collect();
     let cwd = cwd.and_then(|c| CString::new(c).ok());
@@ -1771,6 +1854,8 @@ struct App {
     initial_command: Vec<String>,
     ui: Rc<RefCell<UpdateUi>>,
     last_focus: Option<WindowId>,
+    /// Programs' own notifications (OSC 9 / 777) are held back until then, so a loop can't flood.
+    alert_after: Instant,
     #[cfg(target_os = "macos")]
     tray: Option<macos::Tray>,
     /// The tray is wanted but not made yet; it is made shortly after the first frame, because
@@ -1827,20 +1912,18 @@ impl App {
     /// Slow commands that finished since the last look. With no litty window in front, the Dock
     /// bounces, the hamster shows how it went and a notification says what finished.
     fn take_finished(&mut self, now: Instant) {
-        let mut done = Vec::new();
+        let (mut done, mut alerts) = (Vec::new(), Vec::new());
         for p in self.wins.values().flat_map(|w| w.tabs.iter().flat_map(|t| &t.panes)) {
             // Never wait for a busy parser: the result stays in the grid until the next look.
-            if let Some(f) = p.term.try_lock().ok().and_then(|mut t| t.grid.finished.take()) {
-                done.push((p.id, f));
+            if let Ok(mut t) = p.term.try_lock() {
+                done.extend(t.grid.finished.take().map(|f| (p.id, f)));
+                alerts.extend(t.grid.alert.take().map(|a| (p.id, a)));
             }
         }
-        if done.is_empty() || self.wins.values().any(|w| w.focused) {
+        if (done.is_empty() && alerts.is_empty()) || self.wins.values().any(|w| w.focused) {
             return;
         }
         for (pane, f) in done {
-            if let Some(win) = self.wins.values().find(|w| w.owns(pane)).and_then(|w| w.window.as_ref()) {
-                win.request_user_attention(Some(UserAttentionType::Informational));
-            }
             let title = f.command.unwrap_or_else(|| "Command finished".into());
             let body = match f.exit {
                 0 => format!("Done in {}", took_text(f.took)),
@@ -1849,16 +1932,28 @@ impl App {
             #[cfg(target_os = "macos")]
             {
                 self.tray_done = Some((f.exit == 0, now + Duration::from_secs(10)));
-                if let Some(n) = self.notifier.get_or_insert_with(macos::Notifier::new) {
-                    n.notify(pane, &title, &body);
-                }
             }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = (pane, now);
-                notify_send(&title, &body);
+            self.notify(pane, &title, &body);
+        }
+        for (pane, (title, body)) in alerts {
+            if now >= self.alert_after {
+                self.alert_after = now + Duration::from_secs(2);
+                self.notify(pane, &title, &body);
             }
         }
+    }
+
+    /// Bounce the Dock (or flash the taskbar) for `pane`'s window and post a desktop notification.
+    fn notify(&mut self, pane: usize, title: &str, body: &str) {
+        if let Some(win) = self.wins.values().find(|w| w.owns(pane)).and_then(|w| w.window.as_ref()) {
+            win.request_user_attention(Some(UserAttentionType::Informational));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(n) = self.notifier.get_or_insert_with(macos::Notifier::new) {
+            n.notify(pane, title, body);
+        }
+        #[cfg(not(target_os = "macos"))]
+        notify_send(title, body);
     }
 
     /// Check for updates now, because the user asked.
@@ -2104,6 +2199,7 @@ fn main() {
         initial_command,
         ui: Rc::new(RefCell::new(UpdateUi::default())),
         last_focus: None,
+        alert_after: Instant::now(),
         #[cfg(target_os = "macos")]
         tray: None,
         #[cfg(target_os = "macos")]

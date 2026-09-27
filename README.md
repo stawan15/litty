@@ -45,9 +45,9 @@ Changes apply the next time litty starts.
 
 ## Terminal features
 
-Truecolor, 256 colours, bold/italic/underline, wide characters and combining marks (Thai), colour
+Truecolor, 256 colours, bold/italic, underline styles (single, double, curly, dotted, dashed) and colours (SGR 4:n, 58), wide characters and combining marks (Thai), colour
 emoji (single code points: ZWJ sequences, skin tones and flags show their parts), mouse reporting
-(SGR), bracketed paste, focus events (1004), synchronized output (2026), OSC 7/8/52/133, colour
+(SGR), bracketed paste, focus events (1004), synchronized output (2026), OSC 7/8/52/133, notifications (OSC 9, OSC 777), REP, colour
 queries (OSC 4/10/11/12) and DECRQM mode queries, DSR, alternate screen, scrollback with reflow.
 Not supported yet: images (sixel / Kitty graphics) and the Kitty keyboard protocol (queries are
 answered as "no enhancements").
@@ -62,13 +62,13 @@ ed25519 signature before anything is replaced. If a package manager installed li
 Nix, cargo), the notice shows the command to run instead and Enter copies it.
 
 On macOS a small hamster sits in the menu bar. It runs in its wheel while a command is running in
-any tab (zsh, or any shell that emits OSC 133), and stuffs its cheeks while an update downloads; a
+any tab (zsh, bash, fish, or any shell that emits OSC 133), and stuffs its cheeks while an update downloads; a
 blue dot means an update is ready. Its menu can check for updates, install one, open a window or
 quit. When nothing is happening it stays still and costs no CPU.
 
 ## What makes it different
 
-- **Command blocks.** With zsh (auto-enabled) or any shell that emits OSC 133, failed commands
+- **Command blocks.** With zsh, bash (4.4+ for command names) or fish (all auto-enabled) or any shell that emits OSC 133, failed commands
   get a faint red tint on their output, and slow or failing commands show `exit N  1.2s` at the
   end of the command line. Cmd+Up / Cmd+Down jump between prompts. Cmd+Shift+C copies the last
   command's output (without the prompt); Cmd-click a prompt to select that command's output.
@@ -76,6 +76,7 @@ quit. When nothing is happening it stays still and costs no CPU.
   background, the Dock icon bounces, the menu-bar hamster cheers (exit 0) or looks dizzy (failure),
   and a notification says what finished and how long it took ("cargo build — Done in 2m13s").
   Clicking it brings you to that tab. On Linux the notification goes through `notify-send`.
+  Programs can post their own the same way with OSC 9 or OSC 777 (at most one every 2 s).
 - **Thai word selection.** Thai is written without spaces, so double-clicking Thai text picks the
   dictionary word under the pointer instead of the whole line (maximal matching over PyThaiNLP's
   CC0 word list, loaded on first use).
