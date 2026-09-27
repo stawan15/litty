@@ -40,17 +40,43 @@ litty needs no configuration. To change a default, create `~/.config/litty/confi
     cursor = block        # block | bar | underline
     cursor-blink = false
     tray = true           # macOS menu-bar hamster; false removes it
+    font = JetBrains Mono # a family name or a path to the regular .ttf/.otf
+    padding = 10          # points around the text
+    scrollback = 20000    # lines kept per pane (up to 200000)
+    background = #1a1b26  # also foreground, selection, cursor-color, color0 … color15
+    keybind = ctrl+shift+k = split-right   # or `= none` to pass the keys to the program
+    restore = true        # reopen the tabs, splits and folders open at Quit
+    quick-terminal = ctrl+`   # macOS: a system-wide key that drops a terminal from the top
+    term = xterm-litty    # TERM for programs (default xterm-256color; see below)
 
-Changes apply the next time litty starts.
+Keybind actions: copy, paste, copy-output, new-tab, new-window, close, split-right, split-down,
+find, clear, zoom-in, zoom-out, zoom-reset, next-tab, prev-tab, next-pane, prev-pane,
+prev-prompt, next-prompt, toggle-zoom, record, update. Changes apply the next time litty starts.
+
+`term = xterm-litty` tells programs about litty's extras (undercurl, truecolor, synchronized
+output) through its own terminfo entry, installed with the packages and the app. TERM stays
+`xterm-256color` by default because hosts you ssh into don't have the entry; copy it there with
+`infocmp -x xterm-litty | ssh host tic -x -`. Programs can also check `TERM_PROGRAM=litty`.
 
 ## Terminal features
 
-Truecolor, 256 colours, bold/italic, underline styles (single, double, curly, dotted, dashed) and colours (SGR 4:n, 58), wide characters and combining marks (Thai), colour
-emoji (single code points: ZWJ sequences, skin tones and flags show their parts), mouse reporting
-(SGR), bracketed paste, focus events (1004), synchronized output (2026), OSC 7/8/52/133, notifications (OSC 9, OSC 777), REP, colour
-queries (OSC 4/10/11/12) and DECRQM mode queries, DSR, alternate screen, scrollback with reflow.
-Not supported yet: images (sixel / Kitty graphics) and the Kitty keyboard protocol (queries are
-answered as "no enhancements").
+Truecolor, 256 colours, bold/italic, underline styles (single, double, curly, dotted, dashed) and
+colours (SGR 4:n, 58), wide characters and combining marks (Thai), colour emoji including flags,
+skin tones and ZWJ sequences (drawn over the cells programs count, so the cursor never drifts),
+mouse reporting (SGR), bracketed paste, focus events (1004), synchronized output (2026),
+OSC 7/8/52/133, notifications (OSC 9, OSC 777), colour queries (OSC 4/10/11/12), DECRQM, DSR,
+XTWINOPS size reports, alternate screen, scrollback with reflow.
+
+- **Images:** the Kitty graphics protocol (PNG, RGB, RGBA; inline, file or temporary file),
+  as used by `kitten icat`, chafa, timg, yazi and image.nvim. Images scroll with their text and
+  each pane keeps at most 64 MB of them. Not yet: sixel, shared memory, Unicode placeholders.
+- **Kitty keyboard protocol** (all five enhancement flags), so neovim, helix and fish can tell
+  Ctrl+I from Tab, see key releases and so on.
+- **VT100/VT220 details** checked with vttest: insert mode, autowrap off, origin mode, reverse
+  screen, settable tab stops, DEC line drawing, cursor save with attributes, DECALN, RIS.
+  132-column mode clears the screen but keeps the window size (like xterm by default).
+- **Fonts:** a missing character is looked up in fontconfig (CJK, Hangul, Indic …) when the
+  built-in list has no font for it.
 
 ## Updates
 
@@ -118,6 +144,7 @@ quit. When nothing is happening it stays still and costs no CPU.
 | Cmd+Shift+R | Start / stop recording the pane (asciinema) |
 | Cmd+K | Clear screen and scrollback |
 | Cmd+N | New window |
+| Cmd+Q | Quit, keeping tabs and splits for next time (Ctrl+Shift+Q on Linux) |
 | Cmd+F | Find |
 | Cmd+Up / Down | Previous / next prompt |
 | Cmd+Left / Right / Backspace | Start of line / end of line / delete line |
