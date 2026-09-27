@@ -3,6 +3,7 @@ mod config;
 mod emoji;
 mod font;
 mod grid;
+mod kitty;
 #[cfg(target_os = "macos")]
 mod macos;
 mod present;
@@ -34,7 +35,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{ActiveEventLoopExtMacOS, WindowAttributesExtMacOS, WindowExtMacOS};
@@ -589,6 +590,115 @@ fn mouse_report(g: &Grid, code: u8, mods: ModifiersState, col: usize, row: usize
     } else {
         let c = if release { 3 + m } else { code + m };
         vec![0x1b, b'[', b'M', 32 + c, 33 + col as u8, 33 + row as u8]
+    }
+}
+
+/// The Kitty keyboard protocol's name for a key.
+fn kitty_key(e: &KeyEvent) -> Option<kitty::Key> {
+    use kitty::Key::{Control, Func, Other, Text};
+    let numpad = e.location == KeyLocation::Numpad;
+    let right = e.location == KeyLocation::Right;
+    Some(match &e.key_without_modifiers() {
+        Key::Named(n) if numpad => Other(match n {
+            NamedKey::Enter => 57414,
+            NamedKey::ArrowLeft => 57417,
+            NamedKey::ArrowRight => 57418,
+            NamedKey::ArrowUp => 57419,
+            NamedKey::ArrowDown => 57420,
+            NamedKey::PageUp => 57421,
+            NamedKey::PageDown => 57422,
+            NamedKey::Home => 57423,
+            NamedKey::End => 57424,
+            NamedKey::Insert => 57425,
+            NamedKey::Delete => 57426,
+            NamedKey::Clear => 57427,
+            _ => return None,
+        }),
+        Key::Named(n) => match n {
+            NamedKey::Escape => Control(27),
+            NamedKey::Enter => Control(13),
+            NamedKey::Tab => Control(9),
+            NamedKey::Backspace => Control(127),
+            NamedKey::Space => Text(32, None),
+            NamedKey::Insert => Func(2, '~'),
+            NamedKey::Delete => Func(3, '~'),
+            NamedKey::PageUp => Func(5, '~'),
+            NamedKey::PageDown => Func(6, '~'),
+            NamedKey::ArrowUp => Func(1, 'A'),
+            NamedKey::ArrowDown => Func(1, 'B'),
+            NamedKey::ArrowRight => Func(1, 'C'),
+            NamedKey::ArrowLeft => Func(1, 'D'),
+            NamedKey::Home => Func(1, 'H'),
+            NamedKey::End => Func(1, 'F'),
+            NamedKey::F1 => Func(1, 'P'),
+            NamedKey::F2 => Func(1, 'Q'),
+            NamedKey::F3 => Func(13, '~'),
+            NamedKey::F4 => Func(1, 'S'),
+            NamedKey::F5 => Func(15, '~'),
+            NamedKey::F6 => Func(17, '~'),
+            NamedKey::F7 => Func(18, '~'),
+            NamedKey::F8 => Func(19, '~'),
+            NamedKey::F9 => Func(20, '~'),
+            NamedKey::F10 => Func(21, '~'),
+            NamedKey::F11 => Func(23, '~'),
+            NamedKey::F12 => Func(24, '~'),
+            NamedKey::CapsLock => Other(57358),
+            NamedKey::NumLock => Other(57360),
+            NamedKey::Shift => Other(if right { 57447 } else { 57441 }),
+            NamedKey::Control => Other(if right { 57448 } else { 57442 }),
+            NamedKey::Alt => Other(if right { 57449 } else { 57443 }),
+            NamedKey::Super => Other(if right { 57450 } else { 57444 }),
+            _ => return None,
+        },
+        Key::Character(s) => {
+            let mut chars = s.chars();
+            let c = chars.next().filter(|_| chars.next().is_none())?;
+            if numpad {
+                let code = match c {
+                    '0'..='9' => 57399 + c as u32 - '0' as u32,
+                    '.' => 57409,
+                    '/' => 57410,
+                    '*' => 57411,
+                    '-' => 57412,
+                    '+' => 57413,
+                    '=' => 57415,
+                    _ => return None,
+                };
+                return Some(Other(code));
+            }
+            let shifted = e.text.as_ref().and_then(|t| t.chars().next()).map(|c| c as u32);
+            Text(c.to_lowercase().next().unwrap_or(c) as u32, shifted)
+        }
+        _ => return None,
+    })
+}
+
+/// Bytes for a key under the Kitty keyboard protocol `flags`; None to use the legacy encoding.
+fn kitty_bytes(e: &KeyEvent, mods: ModifiersState, flags: u8) -> Option<Vec<u8>> {
+    let kind = match (e.state, e.repeat) {
+        (ElementState::Released, _) => kitty::Kind::Release,
+        (_, true) => kitty::Kind::Repeat,
+        _ => kitty::Kind::Press,
+    };
+    let mut bits = mods.shift_key() as u8 * kitty::SHIFT + mods.alt_key() as u8 * kitty::ALT + mods.control_key() as u8 * kitty::CTRL + mods.super_key() as u8 * kitty::SUPER;
+    // A modifier key's own event reports the state after it: set while pressed, clear on release
+    // (winit updates the modifiers after the key event).
+    if let Key::Named(n) = &e.logical_key {
+        let own = match n {
+            NamedKey::Shift => kitty::SHIFT,
+            NamedKey::Alt => kitty::ALT,
+            NamedKey::Control => kitty::CTRL,
+            NamedKey::Super => kitty::SUPER,
+            _ => 0,
+        };
+        bits = if kind == kitty::Kind::Release { bits & !own } else { bits | own };
+    }
+    // Only what the key actually types: with Ctrl or Cmd it types nothing, and Option composes
+    // characters on macOS that are not the key's own text.
+    let text = e.text.as_deref().filter(|_| !mods.alt_key() && !mods.control_key() && !mods.super_key());
+    match kitty_key(e) {
+        Some(key) => kitty::encode(key, bits, kind, flags, text),
+        None => (kind == kitty::Kind::Release).then(Vec::new),
     }
 }
 
@@ -1477,9 +1587,22 @@ impl Win {
                 _ => {}
             }
         }
-        let app_cursor = self.term().lock().unwrap().grid.app_cursor;
-        if let Some(bytes) = key_bytes(e, mods, app_cursor) {
+        let (app_cursor, flags) = {
+            let t = self.term().lock().unwrap();
+            (t.grid.app_cursor, t.grid.kbd_flags())
+        };
+        if let Some(bytes) = kitty_bytes(e, mods, flags).or_else(|| key_bytes(e, mods, app_cursor)) {
             self.send_input(&bytes);
+        }
+    }
+
+    /// Key releases matter only to applications that asked for them (Kitty keyboard protocol).
+    fn on_key_release(&mut self, e: &KeyEvent) {
+        let flags = self.term().lock().unwrap().grid.kbd_flags();
+        if flags & kitty::EVENT_TYPES != 0 && !self.mods.super_key() {
+            if let Some(bytes) = kitty_bytes(e, self.mods, flags).filter(|b| !b.is_empty()) {
+                self.send(&bytes);
+            }
         }
     }
 
@@ -1859,6 +1982,7 @@ impl Win {
             }
             _ if self.tabs.is_empty() => {}
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => self.on_key(&event),
+            WindowEvent::KeyboardInput { event, .. } => self.on_key_release(&event),
             WindowEvent::Ime(Ime::Commit(text)) => self.send_input(text.as_bytes()),
             WindowEvent::MouseInput { state, button, .. } => self.on_mouse_button(state, button),
             WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(position.x, position.y),

@@ -16,6 +16,9 @@ pub const UL_SHIFT: u8 = 4;
 pub const UL_COLOR: u8 = 0x80;
 
 const HISTORY_CAP: usize = 20_000;
+/// Kitty keyboard flags litty implements: disambiguate, event types, alternate keys, all keys as
+/// escape codes, associated text.
+const KBD_FLAGS: u8 = 31;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum CursorShape {
@@ -224,6 +227,8 @@ pub struct Grid {
     pub mouse: u8,
     pub mouse_sgr: bool,
     pub in_alt: bool,
+    /// Kitty keyboard protocol flags, a stack per screen (main, alternate); the base entry stays.
+    kbd: [Vec<u8>; 2],
     /// Lines scrolled back from the live screen (0 = live).
     pub scroll: usize,
     /// Total lines ever pushed to history; gives lines a stable absolute id.
@@ -292,6 +297,7 @@ impl Grid {
             mouse: 0,
             mouse_sgr: false,
             in_alt: false,
+            kbd: [vec![0], vec![0]],
             scroll: 0,
             pushed: 0,
             sel: None,
@@ -972,6 +978,11 @@ impl Grid {
         }
     }
 
+    /// The Kitty keyboard protocol flags in effect on the current screen.
+    pub fn kbd_flags(&self) -> u8 {
+        *self.kbd[self.in_alt as usize].last().expect("base entry")
+    }
+
     /// Forward to the n-th next tab stop (every 8 columns), stopping at the last column.
     fn tab(&mut self, n: usize) {
         self.cx = ((self.cx / 8 + n) * 8).min(self.cols - 1);
@@ -1346,10 +1357,35 @@ impl Perform for Grid {
             ([], 'm') => self.sgr(params),
             ([], 's') => self.saved = (self.cx, self.cy),
             ([], 'u') => (self.cx, self.cy) = self.saved,
+            // Kitty keyboard protocol: push, pop, set and query the enhancement flags.
+            ([b'>'], 'u') => {
+                let stack = &mut self.kbd[self.in_alt as usize];
+                if stack.len() > 16 {
+                    stack.remove(1);
+                }
+                stack.push(raw(params, 0) as u8 & KBD_FLAGS);
+            }
+            ([b'<'], 'u') => {
+                let stack = &mut self.kbd[self.in_alt as usize];
+                stack.truncate(stack.len().saturating_sub(n).max(1));
+                if stack.len() == 1 {
+                    stack[0] = 0;
+                }
+            }
+            ([b'='], 'u') => {
+                let (flags, top) = (raw(params, 0) as u8 & KBD_FLAGS, self.kbd[self.in_alt as usize].last_mut().expect("base entry"));
+                match raw(params, 1) {
+                    2 => *top |= flags,
+                    3 => *top &= !flags,
+                    _ => *top = flags,
+                }
+            }
+            ([b'?'], 'u') => {
+                let flags = self.kbd_flags();
+                self.reply.extend(format!("\x1b[?{flags}u").as_bytes());
+            }
             // DSR 5: "are you there?" (used as a sentinel after other queries).
             ([], 'n') if raw(params, 0) == 5 => self.reply.extend(b"\x1b[0n"),
-            // Kitty keyboard protocol query: supported, no enhancements active.
-            ([b'?'], 'u') => self.reply.extend(b"\x1b[?0u"),
             ([], 'n') if raw(params, 0) == 6 => {
                 self.reply.extend(format!("\x1b[{};{}R", self.cy + 1, self.cx + 1).bytes());
             }
@@ -1503,6 +1539,21 @@ mod tests {
         feed(&mut g, "ab\x1b[3b|\x1b[2I|\x1b[Z\x1b[Z#");
         let text: String = g.row(0).iter().map(|c| c.ch).collect();
         assert_eq!(text.trim_end(), "abbbb|  #       |");
+    }
+
+    #[test]
+    fn kitty_keyboard_flags_stack_per_screen() {
+        let mut g = Grid::new(10, 2);
+        feed(&mut g, "\x1b[>1u\x1b[>11u\x1b[?u");
+        assert_eq!((g.kbd_flags(), std::mem::take(&mut g.reply)), (11, b"\x1b[?11u".to_vec()));
+        feed(&mut g, "\x1b[?1049h");
+        assert_eq!(g.kbd_flags(), 0, "the alternate screen has its own stack");
+        feed(&mut g, "\x1b[=5u\x1b[=2;2u\x1b[=4;3u");
+        assert_eq!(g.kbd_flags(), 3);
+        feed(&mut g, "\x1b[?1049l\x1b[<u");
+        assert_eq!(g.kbd_flags(), 1);
+        feed(&mut g, "\x1b[<9u\x1b[>255u");
+        assert_eq!(g.kbd_flags(), 31, "unknown flags are dropped, popping stops at the base");
     }
 
     #[test]
