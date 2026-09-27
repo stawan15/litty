@@ -119,6 +119,52 @@ pub(crate) fn mix_color(a: u32, b: u32, pct: u32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
+/// Emoji sequences on a line that the emoji font draws as one picture: (first cell, cells, text).
+/// Flags are regional-indicator pairs; other sequences are an emoji followed by skin-tone
+/// modifiers or joined by ZWJ. Cells keep the widths programs count for each part, so the cursor
+/// never drifts: the picture fills the first two cells and the rest of the sequence stays blank.
+fn emoji_sequences(line: &[Cell]) -> Vec<(usize, usize, String)> {
+    let zwj = |c: &Cell| c.comb.contains(&'\u{200d}');
+    let ri = |ch: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch);
+    let skin = |ch: char| ('\u{1F3FB}'..='\u{1F3FF}').contains(&ch);
+    if !line.iter().any(|c| ri(c.ch) || skin(c.ch) || zwj(c)) {
+        return Vec::new();
+    }
+    // The next cell that starts a character (skipping wide characters' spacer halves).
+    let next = |x: usize| (x + 1..line.len()).find(|&i| line[i].ch != '\0').unwrap_or(line.len());
+    let text = |c: &Cell| std::iter::once(c.ch).chain(c.comb.iter().copied().filter(|&m| m != '\0')).collect::<String>();
+    let mut out = Vec::new();
+    let mut x = 0;
+    while x < line.len() {
+        let c = &line[x];
+        let n = next(x);
+        if ri(c.ch) {
+            if n < line.len() && ri(line[n].ch) {
+                out.push((x, next(n) - x, text(c) + &text(&line[n])));
+                x = next(n);
+            } else {
+                x = n;
+            }
+            continue;
+        }
+        let (mut last, mut seq) = (x, text(c));
+        while c.ch as u32 >= 0x203C && next(last) < line.len() {
+            let n = next(last);
+            let joined = zwj(&line[last]) && line[n].ch as u32 >= 0x203C;
+            if !(joined || skin(line[n].ch)) {
+                break;
+            }
+            seq += &text(&line[n]);
+            last = n;
+        }
+        if last > x {
+            out.push((x, next(last) - x, seq));
+        }
+        x = next(last);
+    }
+    out
+}
+
 /// Characters that can take part in programming ligatures (`=>`, `!=`, `->`, `<=`, ...).
 fn is_symbol(c: char) -> bool {
     "=<>-!|&:+*/~#_.?%$\\^@;".contains(c)
@@ -310,10 +356,23 @@ impl Renderer {
             x += run;
         }
         let ligatures = if self.fonts.ligatures { self.shape_ligatures(line) } else { Vec::new() };
+        let mut sequences = emoji_sequences(line).into_iter().peekable();
+        let mut covered = 0;
         for (x, c) in line.iter().enumerate() {
             let (fg, bg) = cols[x];
             let style = c.attrs & (BOLD | ITALIC);
-            if self.draw_special(c.ch, ox + x * cw, oy, cw, ch, fg, bg) {
+            if let Some((_, span, seq)) = sequences.next_if(|s| s.0 == x) {
+                let side = (2 * cw).min(ch);
+                if let Some(bmp) = self.fonts.emoji.sequence(&seq, side) {
+                    let (ex, ey) = (ox + x * cw + (2 * cw - side) / 2, oy + (ch - side) / 2);
+                    blend_rgba(&mut self.fb, self.w, self.clip, bmp, ex, ey);
+                    self.mark(ey, ey + side);
+                    covered = x + span;
+                }
+            }
+            if x < covered {
+                // Part of an emoji sequence drawn as one picture.
+            } else if self.draw_special(c.ch, ox + x * cw, oy, cw, ch, fg, bg) {
                 // Box and block characters are drawn to fit the cell.
             } else if c.ch as u32 >= 0x231A && UnicodeWidthChar::width(c.ch) == Some(2) && self.draw_emoji(c.ch, ox + x * cw, oy) {
                 // A colour emoji bitmap.
@@ -616,6 +675,24 @@ mod tests {
             r.draw_pane(&mut g, &PaneView { rect, focused: true, cursor_on: true, find: None, notice: Some(n) });
         }
         r.fb
+    }
+
+    #[test]
+    fn emoji_sequences_are_found_without_moving_cells() {
+        let mut g = Grid::new(30, 1);
+        let mut vt = vte::Parser::new();
+        // Flag, thumbs up + skin tone, family (man ZWJ woman ZWJ girl), then plain text.
+        vt.advance(&mut g, "🇹🇭👍🏽👨\u{200d}👩\u{200d}👧x".as_bytes());
+        let seqs = emoji_sequences(g.row(0));
+        let found: Vec<(usize, usize, usize)> = seqs.iter().map(|(x, span, s)| (*x, *span, s.chars().count())).collect();
+        assert_eq!(found, [(0, 2, 2), (2, 4, 2), (6, 6, 5)]);
+        assert_eq!(g.row(0)[12].ch, 'x', "cells keep the widths programs count");
+        let mut e = crate::emoji::Emoji::default();
+        if cfg!(target_os = "macos") || std::path::Path::new("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf").exists() {
+            for (_, _, s) in &seqs {
+                assert!(e.sequence(s, 40).is_some(), "no single glyph for {s:?}");
+            }
+        }
     }
 
     #[test]
