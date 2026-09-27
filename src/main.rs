@@ -673,6 +673,11 @@ fn kitty_key(e: &KeyEvent) -> Option<kitty::Key> {
     })
 }
 
+/// Modifier bits as the Kitty keyboard protocol (and config keybinds) count them.
+fn kitty_mods(m: ModifiersState) -> u8 {
+    m.shift_key() as u8 * kitty::SHIFT + m.alt_key() as u8 * kitty::ALT + m.control_key() as u8 * kitty::CTRL + m.super_key() as u8 * kitty::SUPER
+}
+
 /// Bytes for a key under the Kitty keyboard protocol `flags`; None to use the legacy encoding.
 fn kitty_bytes(e: &KeyEvent, mods: ModifiersState, flags: u8) -> Option<Vec<u8>> {
     let kind = match (e.state, e.repeat) {
@@ -680,7 +685,7 @@ fn kitty_bytes(e: &KeyEvent, mods: ModifiersState, flags: u8) -> Option<Vec<u8>>
         (_, true) => kitty::Kind::Repeat,
         _ => kitty::Kind::Press,
     };
-    let mut bits = mods.shift_key() as u8 * kitty::SHIFT + mods.alt_key() as u8 * kitty::ALT + mods.control_key() as u8 * kitty::CTRL + mods.super_key() as u8 * kitty::SUPER;
+    let mut bits = kitty_mods(mods);
     // A modifier key's own event reports the state after it: set while pressed, clear on release
     // (winit updates the modifiers after the key event).
     if let Key::Named(n) = &e.logical_key {
@@ -874,7 +879,8 @@ impl Win {
 
     /// Rebuild fonts for the current point size / display scale, then re-layout.
     fn rebuild(&mut self) {
-        self.renderer = Some(Renderer::new(self.font_pt * self.scale, (PAD_PT * self.scale) as usize));
+        let pad = config::get().padding.unwrap_or(PAD_PT);
+        self.renderer = Some(Renderer::new(self.font_pt * self.scale, (pad * self.scale) as usize));
         if let (Some(size), Some(r), Some(p)) = (self.window.as_ref().map(|w| w.inner_size()), &mut self.renderer, &mut self.presenter) {
             p.resize(size.width as usize, size.height as usize);
             r.resize(size.width as usize, size.height as usize);
@@ -1281,22 +1287,13 @@ impl Win {
         match key {
             "v" => self.paste(),
             // Cmd+Shift+C: the last command's output, without its prompt.
-            "c" if shift && self.mods.super_key() => {
-                let term = self.term().clone();
-                if term.lock().unwrap().grid.select_last_output() {
-                    self.copy();
-                    self.redraw_soon();
-                }
-            }
+            "c" if shift && self.mods.super_key() => self.copy_last_output(),
             "c" => self.copy(),
             "r" if shift => self.toggle_recording(),
             "k" => self.clear_screen(),
             "n" => self.new_window(),
             "u" if shift => self.toggle_update_prompt(),
-            "f" => {
-                self.find = Some(String::new());
-                self.find_changed();
-            }
+            "f" => self.start_find(),
             "t" => self.open_tab(),
             "w" => self.close_active(),
             // Splits: Cmd+D right, Cmd+Shift+D down (Ctrl+Shift+O / E on Linux).
@@ -1308,22 +1305,105 @@ impl Win {
             "[" => self.cycle_pane(-1),
             "]" => self.cycle_pane(1),
             "=" | "+" if self.mods.control_key() && self.mods.super_key() => self.equalize_splits(),
-            "=" | "+" => {
-                self.font_pt = (self.font_pt + 1.0).min(48.0);
-                self.rebuild();
-            }
-            "-" | "_" => {
-                self.font_pt = (self.font_pt - 1.0).max(6.0);
-                self.rebuild();
-            }
-            "0" | ")" => {
-                self.font_pt = default_pt();
-                self.rebuild();
-            }
+            "=" | "+" => self.zoom(1.0),
+            "-" | "_" => self.zoom(-1.0),
+            "0" | ")" => self.zoom(0.0),
             d if self.mods.super_key() && d.len() == 1 && ("1"..="9").contains(&d) => self.goto_tab(d.parse().unwrap()),
             _ => return false,
         }
         true
+    }
+
+    fn copy_last_output(&mut self) {
+        let term = self.term().clone();
+        if term.lock().unwrap().grid.select_last_output() {
+            self.copy();
+            self.redraw_soon();
+        }
+    }
+
+    fn start_find(&mut self) {
+        self.find = Some(String::new());
+        self.find_changed();
+    }
+
+    /// Change the font size by `step` points; 0 goes back to the default size.
+    fn zoom(&mut self, step: f32) {
+        self.font_pt = if step == 0.0 { default_pt() } else { (self.font_pt + step).clamp(6.0, 48.0) };
+        self.rebuild();
+    }
+
+    /// Run a named action from a config keybind (names in `config::ACTIONS`).
+    fn run_action(&mut self, action: &str) {
+        match action {
+            "copy" => self.copy(),
+            "paste" => self.paste(),
+            "copy-output" => self.copy_last_output(),
+            "new-tab" => self.open_tab(),
+            "new-window" => self.new_window(),
+            "close" => self.close_active(),
+            "split-right" => self.split(true),
+            "split-down" => self.split(false),
+            "find" => self.start_find(),
+            "clear" => self.clear_screen(),
+            "zoom-in" => self.zoom(1.0),
+            "zoom-out" => self.zoom(-1.0),
+            "zoom-reset" => self.zoom(0.0),
+            "next-tab" => self.cycle_tab(1),
+            "prev-tab" => self.cycle_tab(-1),
+            "next-pane" => self.cycle_pane(1),
+            "prev-pane" => self.cycle_pane(-1),
+            "prev-prompt" => self.jump_prompt(-1),
+            "next-prompt" => self.jump_prompt(1),
+            "toggle-zoom" => self.toggle_zoom(),
+            "record" => self.toggle_recording(),
+            "update" => self.toggle_update_prompt(),
+            _ => {}
+        }
+    }
+
+    /// The config's keybind for this key press: Some(None) sends the keys to the program.
+    fn keybind(&self, e: &KeyEvent) -> Option<Option<&'static str>> {
+        let binds = &config::get().keybinds;
+        if binds.is_empty() {
+            return None;
+        }
+        let name = match &e.key_without_modifiers() {
+            Key::Character(s) => s.to_lowercase(),
+            Key::Named(n) => match n {
+                NamedKey::Enter => "enter",
+                NamedKey::Tab => "tab",
+                NamedKey::Space => "space",
+                NamedKey::Backspace => "backspace",
+                NamedKey::Delete => "delete",
+                NamedKey::Escape => "escape",
+                NamedKey::ArrowUp => "up",
+                NamedKey::ArrowDown => "down",
+                NamedKey::ArrowLeft => "left",
+                NamedKey::ArrowRight => "right",
+                NamedKey::PageUp => "pageup",
+                NamedKey::PageDown => "pagedown",
+                NamedKey::Home => "home",
+                NamedKey::End => "end",
+                NamedKey::F1 => "f1",
+                NamedKey::F2 => "f2",
+                NamedKey::F3 => "f3",
+                NamedKey::F4 => "f4",
+                NamedKey::F5 => "f5",
+                NamedKey::F6 => "f6",
+                NamedKey::F7 => "f7",
+                NamedKey::F8 => "f8",
+                NamedKey::F9 => "f9",
+                NamedKey::F10 => "f10",
+                NamedKey::F11 => "f11",
+                NamedKey::F12 => "f12",
+                _ => return None,
+            }
+            .to_string(),
+            _ => return None,
+        };
+        let mods = kitty_mods(self.mods);
+        binds.iter().find(|b| b.mods == mods && b.key == name).map(|b| b.action.as_deref())
     }
 
     /// Cmd+Shift+R: start or stop recording the focused pane as an asciinema cast.
@@ -1533,6 +1613,11 @@ impl Win {
 
     fn on_key(&mut self, e: &KeyEvent) {
         let mods = self.mods;
+        match self.keybind(e) {
+            Some(Some(action)) => return self.run_action(action),
+            Some(None) => return self.send_key(e),
+            None => {}
+        }
         let cmd = mods.super_key() || (mods.control_key() && mods.shift_key());
         if mods.control_key() && matches!(e.logical_key, Key::Named(NamedKey::Tab)) {
             return self.cycle_tab(if mods.shift_key() { -1 } else { 1 });
@@ -1587,11 +1672,16 @@ impl Win {
                 _ => {}
             }
         }
+        self.send_key(e);
+    }
+
+    /// Send a key to the program in the focused pane.
+    fn send_key(&mut self, e: &KeyEvent) {
         let (app_cursor, flags) = {
             let t = self.term().lock().unwrap();
             (t.grid.app_cursor, t.grid.kbd_flags())
         };
-        if let Some(bytes) = kitty_bytes(e, mods, flags).or_else(|| key_bytes(e, mods, app_cursor)) {
+        if let Some(bytes) = kitty_bytes(e, self.mods, flags).or_else(|| key_bytes(e, self.mods, app_cursor)) {
             self.send_input(&bytes);
         }
     }
@@ -2326,7 +2416,7 @@ impl ApplicationHandler<Ev> for App {
 }
 
 fn main() {
-    theme::init(config::get().light);
+    theme::init(config::get().light, &config::get().colors);
     // Launched from Finder or the Dock the working directory is "/": start in the home directory.
     if std::env::current_dir().is_ok_and(|d| d == std::path::Path::new("/")) {
         if let Some(home) = std::env::var_os("HOME") {

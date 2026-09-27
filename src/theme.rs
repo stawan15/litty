@@ -23,6 +23,8 @@ pub struct Theme {
     pub badge_ok: u32,
     /// Background of small floating panels (find bar, update notice).
     pub panel_bg: u32,
+    /// The block cursor's colour, when the config sets one (otherwise it inverts the cell).
+    pub cursor_block: Option<u32>,
 }
 
 /// Tokyo Night.
@@ -49,6 +51,7 @@ pub const DARK: Theme = Theme {
     rail_thumb: 0x414868,
     badge_ok: 0x565f89,
     panel_bg: 0x24283b,
+    cursor_block: None,
 };
 
 /// Tokyo Night Day.
@@ -75,13 +78,31 @@ pub const LIGHT: Theme = Theme {
     rail_thumb: 0xa1a6c5,
     badge_ok: 0x848cb5,
     panel_bg: 0xd0d5e3,
+    cursor_block: None,
 };
 
 static THEME: OnceLock<&'static Theme> = OnceLock::new();
 
-/// Fix the theme for the process (first call wins).
-pub fn init(light: bool) {
-    let _ = THEME.set(if light { &LIGHT } else { &DARK });
+/// Fix the theme for the process (first call wins), with the config's colour overrides.
+pub fn init(light: bool, colors: &[(usize, u32)]) {
+    use crate::config::{BACKGROUND, CURSOR, FOREGROUND, SELECTION};
+    let base = if light { &LIGHT } else { &DARK };
+    let theme = if colors.is_empty() {
+        base
+    } else {
+        let mut t = Theme { ..*base };
+        for &(slot, c) in colors {
+            match slot {
+                FOREGROUND => (t.fg, t.tab_text_active) = (c, c),
+                BACKGROUND => t.bg = c,
+                SELECTION => t.sel_bg = c,
+                CURSOR => (t.cursor_bar, t.cursor_block) = (c, Some(c)),
+                n => t.ansi[n] = c,
+            }
+        }
+        Box::leak(Box::new(t))
+    };
+    let _ = THEME.set(theme);
 }
 
 pub fn theme() -> &'static Theme {

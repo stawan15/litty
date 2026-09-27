@@ -287,7 +287,7 @@ impl Renderer {
                 (fg, bg) = if Some(*m) == current { (def_bg(), theme().cur_match_bg) } else { (fg, theme().match_bg) };
             }
             let (fg, bg) = if has_cursor && x == cursor_x {
-                (c.bg, c.fg)
+                theme().cursor_block.map_or((c.bg, c.fg), |cur| (def_bg(), cur))
             } else if sel.is_some_and(|(a, b)| x >= a && x < b) {
                 (fg, theme().sel_bg)
             } else {

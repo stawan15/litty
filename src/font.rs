@@ -36,6 +36,66 @@ fn user_family() -> Option<&'static Family> {
     .as_ref()
 }
 
+/// The font the config names (`font = ...`), preferred over everything else.
+fn config_family() -> Option<&'static Family> {
+    static CONFIG: OnceLock<Option<Family>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let regular = font_path(crate::config::get().font.as_deref()?)?;
+            let leak = |p: String| -> &'static str { Box::leak(p.into_boxed_str()) };
+            // Bold and italic are the files named like the regular one (…-Regular.ttf → …-Bold.ttf).
+            let sibling = |style: &str| {
+                let p = regular.replacen("Regular", style, 1);
+                if p != regular && std::path::Path::new(&p).exists() { leak(p) } else { "" }
+            };
+            let files = [sibling("Bold"), sibling("Italic"), sibling("BoldItalic")];
+            Some(Family { files: [leak(regular.clone()), files[0], files[1], files[2]], index: [0; 4] })
+        })
+        .as_ref()
+}
+
+/// A font file for `want`: a path (`~/` allowed), or a family name looked up with fontconfig and
+/// then in the usual font folders (file named `<Family>-Regular.ttf` or `<Family>.ttf`, spaces ignored).
+fn font_path(want: &str) -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if want.contains('/') {
+        let path = want.strip_prefix("~/").map_or(want.to_string(), |rest| format!("{home}/{rest}"));
+        return std::path::Path::new(&path).exists().then_some(path);
+    }
+    let norm = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+    let name = norm(want);
+    // fc-match always answers, falling back to another family; only accept the one asked for.
+    if let Ok(out) = std::process::Command::new("fc-match").args(["-f", "%{family}\n%{file}", &format!("{want}:style=Regular")]).output() {
+        let out = String::from_utf8_lossy(&out.stdout);
+        if let Some((families, file)) = out.split_once('\n') {
+            if families.split(',').any(|f| norm(f) == name) {
+                return Some(file.trim().to_string());
+            }
+        }
+    }
+    fn walk(dir: &std::path::Path, depth: u32, hit: &dyn Fn(&str) -> bool) -> Option<String> {
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = e.path();
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                if let Some(found) = (depth > 0).then(|| walk(&path, depth - 1, hit)).flatten() {
+                    return Some(found);
+                }
+            } else if let (Some(stem), Some("ttf" | "otf")) = (path.file_stem().and_then(|s| s.to_str()), path.extension().and_then(|s| s.to_str())) {
+                if hit(stem) {
+                    return path.to_str().map(String::from);
+                }
+            }
+        }
+        None
+    }
+    let hit = |stem: &str| norm(stem) == name || norm(stem) == format!("{name}regular");
+    ["Library/Fonts", ".local/share/fonts", ".fonts"]
+        .iter()
+        .map(|d| format!("{home}/{d}"))
+        .chain(["/Library/Fonts", "/System/Library/Fonts", "/usr/local/share/fonts", "/usr/share/fonts"].map(String::from))
+        .find_map(|d| walk(std::path::Path::new(&d), 3, &hit))
+}
+
 const MENLO: &str = "/System/Library/Fonts/Menlo.ttc";
 
 const FAMILIES: &[Family] = &[
@@ -213,8 +273,9 @@ pub struct Fonts {
 
 impl Fonts {
     pub fn new(px: f32) -> Self {
-        let (family, regular) = user_family()
+        let (family, regular) = config_family()
             .into_iter()
+            .chain(user_family())
             .chain(FAMILIES.iter())
             .find_map(|f| Face::load(f.files[0], f.index[0], px).map(|face| (f, face)))
             .expect("no monospace font found");
@@ -233,7 +294,7 @@ impl Fonts {
             ascii: std::array::from_fn(|_| (0..128).map(|_| None).collect()),
             other: HashMap::new(),
             by_id: HashMap::new(),
-            ligatures: user_family().is_some_and(|u| std::ptr::eq(u, family)),
+            ligatures: config_family().into_iter().chain(user_family()).any(|u| std::ptr::eq(u, family)),
             emoji: Default::default(),
         }
     }
@@ -376,6 +437,15 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(f.glyph('\u{0e48}', 0).m.advance_width, 0.0);
         }
+    }
+
+    #[test]
+    fn fonts_are_found_by_path_or_family_name() {
+        let Some(maple) = user_family() else { return }; // needs Maple Mono NF installed
+        assert_eq!(font_path(maple.files[0]).as_deref(), Some(maple.files[0]));
+        let found = font_path("Maple Mono NF").expect("found by family name");
+        assert!(found.ends_with("MapleMono-NF-Regular.ttf"), "{found}");
+        assert_eq!(font_path("No Such Font Family"), None);
     }
 
     #[test]

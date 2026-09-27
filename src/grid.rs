@@ -15,7 +15,6 @@ pub const UL_SHIFT: u8 = 4;
 /// The cell's `ul` holds an underline colour (SGR 58); otherwise the underline takes the text colour.
 pub const UL_COLOR: u8 = 0x80;
 
-const HISTORY_CAP: usize = 20_000;
 /// Kitty keyboard flags litty implements: disambiguate, event types, alternate keys, all keys as
 /// escape codes, associated text.
 const KBD_FLAGS: u8 = 31;
@@ -492,9 +491,13 @@ impl Grid {
         // Drop trailing blanks so history stays small for typical short lines.
         let len = row.iter().rposition(|x| !(x.ch == ' ' && x.bg == def_bg() && x.attrs & UNDERLINE == 0)).map_or(0, |i| i + 1);
         // At capacity, recycle the evicted line's allocation.
-        let mut line = if history.len() == HISTORY_CAP { history.pop_front().unwrap_or_default() } else { HLine::default() };
+        let cap = crate::config::get().scrollback;
+        let mut line = if history.len() >= cap { history.pop_front().unwrap_or_default() } else { HLine::default() };
         line.encode(&row[..len]);
         history.push_back(line);
+        while history.len() > cap {
+            history.pop_front();
+        }
         *pushed += 1;
         let base = *pushed - history.len() as u64;
         while marks.front().is_some_and(|m| m.start < base) {
