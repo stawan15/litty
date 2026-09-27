@@ -2,12 +2,15 @@ mod boxdraw;
 mod config;
 mod emoji;
 mod font;
+mod graphics;
 mod grid;
+mod kitty;
 #[cfg(target_os = "macos")]
 mod macos;
 mod present;
 mod record;
 mod render;
+mod session;
 mod thai;
 mod theme;
 mod update;
@@ -34,7 +37,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{ActiveEventLoopExtMacOS, WindowAttributesExtMacOS, WindowExtMacOS};
@@ -60,6 +63,8 @@ struct Term {
     parser: Parser,
     /// Cmd+Shift+R: this pane's output is being saved as an asciinema cast.
     recorder: Option<record::Recorder>,
+    /// Takes image commands (APC) out of the output before the VT parser, which drops them.
+    apc: graphics::ApcSplit,
 }
 
 enum Ev {
@@ -222,6 +227,8 @@ struct UpdateUi {
     open: bool,
     /// The package-manager command for updating, when litty may not replace itself.
     managed: Option<String>,
+    /// The update is a system package, installed as soon as it's downloaded.
+    installs_now: bool,
     /// A check the user asked for (from the tray) is running.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     checking: bool,
@@ -264,10 +271,7 @@ fn install_update(ui: &RefCell<UpdateUi>, proxy: &EventLoopProxy<Ev>) {
     ui.state = update::State::Downloading(version.clone());
     let proxy = proxy.clone();
     std::thread::spawn(move || {
-        let ev = match update::stage(&version) {
-            Ok(path) => update::Event::Staged(version, path),
-            Err(msg) => update::Event::Failed(msg),
-        };
+        let ev = update::stage(&version).unwrap_or_else(update::Event::Failed);
         let _ = proxy.send_event(Ev::Update(ev));
     });
 }
@@ -278,6 +282,8 @@ enum Want {
     Tab(Option<String>),
     /// A new independent window.
     Window(Option<String>),
+    /// Quit litty, keeping the session for the next launch (Ctrl+Shift+Q on Linux).
+    Quit,
 }
 
 /// One window: on macOS exactly one tab (native tabs are separate windows), elsewhere it draws its own tab bar.
@@ -362,13 +368,75 @@ if [[ -o interactive ]]; then
 fi
 "#;
 
-fn install_zsh_integration() -> Option<PathBuf> {
+/// The same for bash. litty starts it as `-bash --posix` with ENV pointing here: a POSIX-mode shell
+/// reads only $ENV, so this script leaves POSIX mode and reads the usual login files itself before
+/// adding the hooks. The command line comes from history in PS0 (bash 4.4+), and only when this
+/// line was saved (so HISTCONTROL=ignorespace never names the wrong command).
+const BASH_INTEGRATION: &str = r#"# litty shell integration (OSC 133 prompt marks).
+builtin set +o posix
+if [ -n "${LT_ORIG_ENV+x}" ]; then export ENV="$LT_ORIG_ENV"; else builtin unset ENV; fi
+builtin unset LT_ORIG_ENV
+[ -r /etc/profile ] && builtin source /etc/profile
+for __lt_f in ~/.bash_profile ~/.bash_login ~/.profile; do
+  [ -r "$__lt_f" ] && { builtin source "$__lt_f"; break; }
+done
+builtin unset __lt_f
+__lt_precmd() {
+  local s=$?
+  __lt_next=$HISTCMD
+  builtin printf '\e]133;D;%s\a\e]133;A\a\e]7;file://%s%s\a' "$s" "$HOSTNAME" "${PWD// /%20}"
+  return $s
+}
+__lt_preexec() {
+  local LC_ALL=C h s o= c i
+  h=$(HISTTIMEFORMAT= builtin history 1)
+  h=${h#"${h%%[![:space:]]*}"}
+  if [ "${h%%[![:digit:]]*}" = "$__lt_next" ]; then
+    s=${h#*[[:digit:]]  }
+    s=${s:0:200}
+    for (( i = 0; i < ${#s}; i++ )); do
+      c=${s:i:1}
+      case $c in [A-Za-z0-9._~/-]) o+=$c ;; *) builtin printf -v c '%%%02X' "'$c"; o+=$c ;; esac
+    done
+  fi
+  builtin printf '\e]133;C;cmdline_url=%s\a' "$o"
+}
+PROMPT_COMMAND="__lt_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+PS0='$(__lt_preexec)'"${PS0:-}"
+"#;
+
+/// The same for fish, found through XDG_DATA_DIRS as a vendor configuration snippet.
+const FISH_INTEGRATION: &str = r#"# litty shell integration (OSC 133 prompt marks).
+if set -q LT_ORIG_XDG_DATA_DIRS
+    if test -n "$LT_ORIG_XDG_DATA_DIRS"
+        set -gx XDG_DATA_DIRS $LT_ORIG_XDG_DATA_DIRS
+    else
+        set -e XDG_DATA_DIRS
+    end
+    set -e LT_ORIG_XDG_DATA_DIRS
+end
+if status is-interactive
+    function __lt_prompt --on-event fish_prompt
+        printf '\e]133;D;%s\a\e]133;A\a\e]7;file://%s%s\a' "$__lt_status" $hostname (string replace -a ' ' '%20' -- $PWD)
+    end
+    function __lt_preexec --on-event fish_preexec
+        printf '\e]133;C;cmdline_url=%s\a' (string escape --style=url -- (string sub -l 200 -- $argv[1]))
+    end
+    function __lt_postexec --on-event fish_postexec
+        set -g __lt_status $status
+    end
+end
+"#;
+
+/// Write a shell integration script to `<cache>/litty/<dir>/<file>`; returns that directory.
+fn install_integration(dir: &str, file: &str, script: &str) -> Option<PathBuf> {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    let dir = cache.join("litty/zsh");
-    std::fs::create_dir_all(&dir).ok()?;
-    std::fs::write(dir.join(".zshenv"), ZSH_INTEGRATION).ok()?;
+    let dir = cache.join("litty").join(dir);
+    let path = dir.join(file);
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    std::fs::write(path, script).ok()?;
     Some(dir)
 }
 
@@ -391,10 +459,10 @@ fn resolve_program(name: &str) -> Option<CString> {
 fn spawn_shell(size: &Winsize, command: &[String], cwd: Option<&str>) -> Option<(File, i32)> {
     let login = command.is_empty();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let (path, argv): (CString, Vec<CString>) = if login {
+    let name = shell.rsplit('/').next().unwrap_or("sh");
+    let (path, mut argv): (CString, Vec<CString>) = if login {
         // Login shell, like other terminals: argv[0] is "-name".
-        let name = format!("-{}", shell.rsplit('/').next().unwrap_or("sh"));
-        (CString::new(shell.clone()).ok()?, vec![CString::new(name).ok()?])
+        (CString::new(shell.clone()).ok()?, vec![CString::new(format!("-{name}")).ok()?])
     } else {
         (resolve_program(&command[0])?, command.iter().map(|a| CString::new(a.as_str()).ok()).collect::<Option<_>>()?)
     };
@@ -405,16 +473,44 @@ fn spawn_shell(size: &Winsize, command: &[String], cwd: Option<&str>) -> Option<
         env.retain(|(ek, _)| ek != k);
         env.push((k.to_string(), v));
     };
-    set("TERM", "xterm-256color".into());
+    set("TERM", config::get().term.clone().unwrap_or_else(|| "xterm-256color".into()));
     set("COLORTERM", "truecolor".into());
+    set("TERM_PROGRAM", "litty".into());
+    set("TERM_PROGRAM_VERSION", update::VERSION.into());
+    // The app bundle carries litty's terminfo (xterm-litty); the trailing ':' keeps the system's.
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.parent()?.join("Resources/terminfo"))).filter(|d| d.is_dir()) {
+        let rest = std::env::var("TERMINFO_DIRS").unwrap_or_default();
+        set("TERMINFO_DIRS", format!("{}:{rest}", dir.display()));
+    }
     if std::env::var_os("LANG").is_none() {
         set("LANG", "en_US.UTF-8".into());
     }
-    if login && shell.ends_with("/zsh") {
-        if let Some(dir) = install_zsh_integration() {
-            set("LT_ORIG_ZDOTDIR", std::env::var("ZDOTDIR").unwrap_or_default());
-            set("ZDOTDIR", dir.to_string_lossy().into_owned());
+    // Shell integration: the shell reports prompts and commands (OSC 133) for command blocks.
+    match name {
+        "zsh" if login => {
+            if let Some(dir) = install_integration("zsh", ".zshenv", ZSH_INTEGRATION) {
+                set("LT_ORIG_ZDOTDIR", std::env::var("ZDOTDIR").unwrap_or_default());
+                set("ZDOTDIR", dir.to_string_lossy().into_owned());
+            }
         }
+        "bash" if login => {
+            if let Some(dir) = install_integration("bash", "litty.bash", BASH_INTEGRATION) {
+                if let Ok(env) = std::env::var("ENV") {
+                    set("LT_ORIG_ENV", env);
+                }
+                set("ENV", dir.join("litty.bash").to_string_lossy().into_owned());
+                argv.push(CString::new("--posix").ok()?);
+            }
+        }
+        "fish" if login => {
+            if let Some(dir) = install_integration("fish", "fish/vendor_conf.d/litty.fish", FISH_INTEGRATION) {
+                let orig = std::env::var("XDG_DATA_DIRS").unwrap_or_default();
+                let rest = if orig.is_empty() { "/usr/local/share:/usr/share" } else { &orig };
+                set("XDG_DATA_DIRS", format!("{}:{rest}", dir.display()));
+                set("LT_ORIG_XDG_DATA_DIRS", orig);
+            }
+        }
+        _ => {}
     }
     let envp: Vec<CString> = env.iter().filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok()).collect();
     let cwd = cwd.and_then(|c| CString::new(c).ok());
@@ -445,8 +541,11 @@ fn spawn_reader(id: usize, mut pty: File, term: Arc<Mutex<Term>>, pending: Arc<A
             debug_log("out", &buf[..n]);
             let reply = {
                 let mut t = term.lock().unwrap();
-                let Term { grid, parser, recorder } = &mut *t;
-                parser.advance(grid, &buf[..n]);
+                let Term { grid, parser, recorder, apc } = &mut *t;
+                apc.split(&buf[..n], |piece| match piece {
+                    graphics::Piece::Text(text) => parser.advance(grid, text),
+                    graphics::Piece::Apc(payload) => grid.apc(payload),
+                });
                 if let Some(r) = recorder {
                     r.output(&buf[..n]);
                 }
@@ -507,6 +606,120 @@ fn mouse_report(g: &Grid, code: u8, mods: ModifiersState, col: usize, row: usize
     } else {
         let c = if release { 3 + m } else { code + m };
         vec![0x1b, b'[', b'M', 32 + c, 33 + col as u8, 33 + row as u8]
+    }
+}
+
+/// The Kitty keyboard protocol's name for a key.
+fn kitty_key(e: &KeyEvent) -> Option<kitty::Key> {
+    use kitty::Key::{Control, Func, Other, Text};
+    let numpad = e.location == KeyLocation::Numpad;
+    let right = e.location == KeyLocation::Right;
+    Some(match &e.key_without_modifiers() {
+        Key::Named(n) if numpad => Other(match n {
+            NamedKey::Enter => 57414,
+            NamedKey::ArrowLeft => 57417,
+            NamedKey::ArrowRight => 57418,
+            NamedKey::ArrowUp => 57419,
+            NamedKey::ArrowDown => 57420,
+            NamedKey::PageUp => 57421,
+            NamedKey::PageDown => 57422,
+            NamedKey::Home => 57423,
+            NamedKey::End => 57424,
+            NamedKey::Insert => 57425,
+            NamedKey::Delete => 57426,
+            NamedKey::Clear => 57427,
+            _ => return None,
+        }),
+        Key::Named(n) => match n {
+            NamedKey::Escape => Control(27),
+            NamedKey::Enter => Control(13),
+            NamedKey::Tab => Control(9),
+            NamedKey::Backspace => Control(127),
+            NamedKey::Space => Text(32, None),
+            NamedKey::Insert => Func(2, '~'),
+            NamedKey::Delete => Func(3, '~'),
+            NamedKey::PageUp => Func(5, '~'),
+            NamedKey::PageDown => Func(6, '~'),
+            NamedKey::ArrowUp => Func(1, 'A'),
+            NamedKey::ArrowDown => Func(1, 'B'),
+            NamedKey::ArrowRight => Func(1, 'C'),
+            NamedKey::ArrowLeft => Func(1, 'D'),
+            NamedKey::Home => Func(1, 'H'),
+            NamedKey::End => Func(1, 'F'),
+            NamedKey::F1 => Func(1, 'P'),
+            NamedKey::F2 => Func(1, 'Q'),
+            NamedKey::F3 => Func(13, '~'),
+            NamedKey::F4 => Func(1, 'S'),
+            NamedKey::F5 => Func(15, '~'),
+            NamedKey::F6 => Func(17, '~'),
+            NamedKey::F7 => Func(18, '~'),
+            NamedKey::F8 => Func(19, '~'),
+            NamedKey::F9 => Func(20, '~'),
+            NamedKey::F10 => Func(21, '~'),
+            NamedKey::F11 => Func(23, '~'),
+            NamedKey::F12 => Func(24, '~'),
+            NamedKey::CapsLock => Other(57358),
+            NamedKey::NumLock => Other(57360),
+            NamedKey::Shift => Other(if right { 57447 } else { 57441 }),
+            NamedKey::Control => Other(if right { 57448 } else { 57442 }),
+            NamedKey::Alt => Other(if right { 57449 } else { 57443 }),
+            NamedKey::Super => Other(if right { 57450 } else { 57444 }),
+            _ => return None,
+        },
+        Key::Character(s) => {
+            let mut chars = s.chars();
+            let c = chars.next().filter(|_| chars.next().is_none())?;
+            if numpad {
+                let code = match c {
+                    '0'..='9' => 57399 + c as u32 - '0' as u32,
+                    '.' => 57409,
+                    '/' => 57410,
+                    '*' => 57411,
+                    '-' => 57412,
+                    '+' => 57413,
+                    '=' => 57415,
+                    _ => return None,
+                };
+                return Some(Other(code));
+            }
+            let shifted = e.text.as_ref().and_then(|t| t.chars().next()).map(|c| c as u32);
+            Text(c.to_lowercase().next().unwrap_or(c) as u32, shifted)
+        }
+        _ => return None,
+    })
+}
+
+/// Modifier bits as the Kitty keyboard protocol (and config keybinds) count them.
+fn kitty_mods(m: ModifiersState) -> u8 {
+    m.shift_key() as u8 * kitty::SHIFT + m.alt_key() as u8 * kitty::ALT + m.control_key() as u8 * kitty::CTRL + m.super_key() as u8 * kitty::SUPER
+}
+
+/// Bytes for a key under the Kitty keyboard protocol `flags`; None to use the legacy encoding.
+fn kitty_bytes(e: &KeyEvent, mods: ModifiersState, flags: u8) -> Option<Vec<u8>> {
+    let kind = match (e.state, e.repeat) {
+        (ElementState::Released, _) => kitty::Kind::Release,
+        (_, true) => kitty::Kind::Repeat,
+        _ => kitty::Kind::Press,
+    };
+    let mut bits = kitty_mods(mods);
+    // A modifier key's own event reports the state after it: set while pressed, clear on release
+    // (winit updates the modifiers after the key event).
+    if let Key::Named(n) = &e.logical_key {
+        let own = match n {
+            NamedKey::Shift => kitty::SHIFT,
+            NamedKey::Alt => kitty::ALT,
+            NamedKey::Control => kitty::CTRL,
+            NamedKey::Super => kitty::SUPER,
+            _ => 0,
+        };
+        bits = if kind == kitty::Kind::Release { bits & !own } else { bits | own };
+    }
+    // Only what the key actually types: with Ctrl or Cmd it types nothing, and Option composes
+    // characters on macOS that are not the key's own text.
+    let text = e.text.as_deref().filter(|_| !mods.alt_key() && !mods.control_key() && !mods.super_key());
+    match kitty_key(e) {
+        Some(key) => kitty::encode(key, bits, kind, flags, text),
+        None => (kind == kitty::Kind::Release).then(Vec::new),
     }
 }
 
@@ -668,8 +881,10 @@ impl Win {
                     r.resize(cols, rows);
                 }
                 grid.resize(cols, rows);
+                grid.cell_px = cell;
                 drop(t);
-                let ws = Winsize { ws_row: rows as u16, ws_col: cols as u16, ws_xpixel: rect.w as u16, ws_ypixel: rect.h as u16 };
+                // Pixel size of the text area (programs divide it by rows/columns to size images).
+                let ws = Winsize { ws_row: rows as u16, ws_col: cols as u16, ws_xpixel: (cols * cell.0) as u16, ws_ypixel: (rows * cell.1) as u16 };
                 let _ = unsafe { tiocswinsz(pane.master.as_raw_fd(), &ws) };
             }
             for pane in &tab.panes {
@@ -682,7 +897,8 @@ impl Win {
 
     /// Rebuild fonts for the current point size / display scale, then re-layout.
     fn rebuild(&mut self) {
-        self.renderer = Some(Renderer::new(self.font_pt * self.scale, (PAD_PT * self.scale) as usize));
+        let pad = config::get().padding.unwrap_or(PAD_PT);
+        self.renderer = Some(Renderer::new(self.font_pt * self.scale, (pad * self.scale) as usize));
         if let (Some(size), Some(r), Some(p)) = (self.window.as_ref().map(|w| w.inner_size()), &mut self.renderer, &mut self.presenter) {
             p.resize(size.width as usize, size.height as usize);
             r.resize(size.width as usize, size.height as usize);
@@ -766,7 +982,9 @@ impl Win {
             eprintln!("litty: failed to start a shell");
             return None;
         };
-        let term = Arc::new(Mutex::new(Term { grid: Grid::new(cols, rows), parser: Parser::new(), recorder: None }));
+        let mut grid = Grid::new(cols, rows);
+        grid.cell_px = self.renderer.as_ref().map_or((10, 20), |r| (r.fonts.cell_w, r.fonts.cell_h));
+        let term = Arc::new(Mutex::new(Term { grid, parser: Parser::new(), recorder: None, apc: Default::default() }));
         let (pending, exited) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let id = NEXT_PANE.fetch_add(1, Ordering::Relaxed);
         spawn_reader(id, master.try_clone().ok()?, term.clone(), pending.clone(), exited.clone(), pid, self.proxy.clone());
@@ -798,17 +1016,67 @@ impl Win {
 
     /// Split the focused pane: `vertical` puts the new pane to its right, otherwise below.
     fn split(&mut self, vertical: bool) {
-        let cwd = self.current_dir();
-        let Some(pane) = self.spawn_pane(&[], cwd.as_deref()) else { return };
+        let (target, cwd) = (self.tab().active, self.current_dir());
+        if let Some(new_id) = self.split_pane(target, vertical, cwd.as_deref(), 0.5) {
+            self.relayout();
+            self.focus_pane(new_id);
+        }
+    }
+
+    /// Split pane `target` of the current tab, giving it `ratio` of the space; returns the new pane.
+    fn split_pane(&mut self, target: usize, vertical: bool, cwd: Option<&str>, ratio: f32) -> Option<usize> {
+        let pane = self.spawn_pane(&[], cwd)?;
         let new_id = pane.id;
         let tab = &mut self.tabs[self.active];
         tab.zoom = false;
-        if !tab.root.split(tab.active, vertical, new_id) {
-            return;
+        if !tab.root.split(target, vertical, new_id) {
+            return None;
+        }
+        let path = tab.root.path_to(target)?;
+        if let Some(Node::Split { ratio: r, .. }) = tab.root.node_at_mut(&path[..path.len() - 1]) {
+            *r = ratio;
         }
         tab.panes.push(pane);
+        Some(new_id)
+    }
+
+    /// The tabs of this window for the session file.
+    fn session_tabs(&self, group: usize) -> Vec<session::TabState> {
+        fn layout(node: &Node, tab: &Tab) -> session::Layout {
+            match node {
+                Node::Leaf(id) => session::Layout::Pane(tab.panes.iter().find(|p| p.id == *id).and_then(|p| p.term.lock().unwrap().grid.cwd.clone())),
+                Node::Split { vertical, ratio, a, b } => session::Layout::Split { vertical: *vertical, ratio: *ratio, a: Box::new(layout(a, tab)), b: Box::new(layout(b, tab)) },
+            }
+        }
+        self.tabs
+            .iter()
+            .map(|tab| {
+                let mut leaves = Vec::new();
+                tab.root.leaves(&mut leaves);
+                let active = leaves.iter().position(|&id| id == tab.active).unwrap_or(0);
+                session::TabState { group, active, layout: layout(&tab.root, tab) }
+            })
+            .collect()
+    }
+
+    /// Rebuild a saved tab's splits in the current tab (which holds one pane) and focus its pane.
+    fn restore_tab(&mut self, saved: &session::TabState) {
+        fn build(win: &mut Win, node: &session::Layout, target: usize) {
+            if let session::Layout::Split { vertical, ratio, a, b } = node {
+                if let Some(new_id) = win.split_pane(target, *vertical, b.first_dir(), *ratio) {
+                    build(win, a, target);
+                    build(win, b, new_id);
+                }
+            }
+        }
+        let first = self.tab().active;
+        build(self, &saved.layout, first);
         self.relayout();
-        self.focus_pane(new_id);
+        let mut leaves = Vec::new();
+        self.tab().root.leaves(&mut leaves);
+        if let Some(&id) = leaves.get(saved.active) {
+            self.focus_pane(id);
+        }
     }
 
     /// Reset per-pane interaction state (selection, mouse, find) when focus moves.
@@ -1089,33 +1357,14 @@ impl Win {
         match key {
             "v" => self.paste(),
             // Cmd+Shift+C: the last command's output, without its prompt.
-            "c" if shift && self.mods.super_key() => {
-                let term = self.term().clone();
-                if term.lock().unwrap().grid.select_last_output() {
-                    self.copy();
-                    self.redraw_soon();
-                }
-            }
+            "c" if shift && self.mods.super_key() => self.copy_last_output(),
             "c" => self.copy(),
             "r" if shift => self.toggle_recording(),
             "k" => self.clear_screen(),
             "n" => self.new_window(),
-            "u" if shift => {
-                {
-                    let mut ui = self.ui.borrow_mut();
-                    match ui.state {
-                        update::State::None => {}
-                        update::State::Failed(_) => ui.state = update::State::None,
-                        _ => ui.open = !ui.open,
-                    }
-                    ui.generation += 1;
-                }
-                self.notice_changed();
-            }
-            "f" => {
-                self.find = Some(String::new());
-                self.find_changed();
-            }
+            "q" if !cfg!(target_os = "macos") => self.want = Some(Want::Quit),
+            "u" if shift => self.toggle_update_prompt(),
+            "f" => self.start_find(),
             "t" => self.open_tab(),
             "w" => self.close_active(),
             // Splits: Cmd+D right, Cmd+Shift+D down (Ctrl+Shift+O / E on Linux).
@@ -1127,22 +1376,105 @@ impl Win {
             "[" => self.cycle_pane(-1),
             "]" => self.cycle_pane(1),
             "=" | "+" if self.mods.control_key() && self.mods.super_key() => self.equalize_splits(),
-            "=" | "+" => {
-                self.font_pt = (self.font_pt + 1.0).min(48.0);
-                self.rebuild();
-            }
-            "-" | "_" => {
-                self.font_pt = (self.font_pt - 1.0).max(6.0);
-                self.rebuild();
-            }
-            "0" | ")" => {
-                self.font_pt = default_pt();
-                self.rebuild();
-            }
+            "=" | "+" => self.zoom(1.0),
+            "-" | "_" => self.zoom(-1.0),
+            "0" | ")" => self.zoom(0.0),
             d if self.mods.super_key() && d.len() == 1 && ("1"..="9").contains(&d) => self.goto_tab(d.parse().unwrap()),
             _ => return false,
         }
         true
+    }
+
+    fn copy_last_output(&mut self) {
+        let term = self.term().clone();
+        if term.lock().unwrap().grid.select_last_output() {
+            self.copy();
+            self.redraw_soon();
+        }
+    }
+
+    fn start_find(&mut self) {
+        self.find = Some(String::new());
+        self.find_changed();
+    }
+
+    /// Change the font size by `step` points; 0 goes back to the default size.
+    fn zoom(&mut self, step: f32) {
+        self.font_pt = if step == 0.0 { default_pt() } else { (self.font_pt + step).clamp(6.0, 48.0) };
+        self.rebuild();
+    }
+
+    /// Run a named action from a config keybind (names in `config::ACTIONS`).
+    fn run_action(&mut self, action: &str) {
+        match action {
+            "copy" => self.copy(),
+            "paste" => self.paste(),
+            "copy-output" => self.copy_last_output(),
+            "new-tab" => self.open_tab(),
+            "new-window" => self.new_window(),
+            "close" => self.close_active(),
+            "split-right" => self.split(true),
+            "split-down" => self.split(false),
+            "find" => self.start_find(),
+            "clear" => self.clear_screen(),
+            "zoom-in" => self.zoom(1.0),
+            "zoom-out" => self.zoom(-1.0),
+            "zoom-reset" => self.zoom(0.0),
+            "next-tab" => self.cycle_tab(1),
+            "prev-tab" => self.cycle_tab(-1),
+            "next-pane" => self.cycle_pane(1),
+            "prev-pane" => self.cycle_pane(-1),
+            "prev-prompt" => self.jump_prompt(-1),
+            "next-prompt" => self.jump_prompt(1),
+            "toggle-zoom" => self.toggle_zoom(),
+            "record" => self.toggle_recording(),
+            "update" => self.toggle_update_prompt(),
+            _ => {}
+        }
+    }
+
+    /// The config's keybind for this key press: Some(None) sends the keys to the program.
+    fn keybind(&self, e: &KeyEvent) -> Option<Option<&'static str>> {
+        let binds = &config::get().keybinds;
+        if binds.is_empty() {
+            return None;
+        }
+        let name = match &e.key_without_modifiers() {
+            Key::Character(s) => s.to_lowercase(),
+            Key::Named(n) => match n {
+                NamedKey::Enter => "enter",
+                NamedKey::Tab => "tab",
+                NamedKey::Space => "space",
+                NamedKey::Backspace => "backspace",
+                NamedKey::Delete => "delete",
+                NamedKey::Escape => "escape",
+                NamedKey::ArrowUp => "up",
+                NamedKey::ArrowDown => "down",
+                NamedKey::ArrowLeft => "left",
+                NamedKey::ArrowRight => "right",
+                NamedKey::PageUp => "pageup",
+                NamedKey::PageDown => "pagedown",
+                NamedKey::Home => "home",
+                NamedKey::End => "end",
+                NamedKey::F1 => "f1",
+                NamedKey::F2 => "f2",
+                NamedKey::F3 => "f3",
+                NamedKey::F4 => "f4",
+                NamedKey::F5 => "f5",
+                NamedKey::F6 => "f6",
+                NamedKey::F7 => "f7",
+                NamedKey::F8 => "f8",
+                NamedKey::F9 => "f9",
+                NamedKey::F10 => "f10",
+                NamedKey::F11 => "f11",
+                NamedKey::F12 => "f12",
+                _ => return None,
+            }
+            .to_string(),
+            _ => return None,
+        };
+        let mods = kitty_mods(self.mods);
+        binds.iter().find(|b| b.mods == mods && b.key == name).map(|b| b.action.as_deref())
     }
 
     /// Cmd+Shift+R: start or stop recording the focused pane as an asciinema cast.
@@ -1178,12 +1510,42 @@ impl Win {
             update::State::Available(v) if !ui.open => format!("↑ {v}  {key}"),
             update::State::Available(v) => match &ui.managed {
                 Some(cmd) => format!("{v} · {cmd} · Enter: copy · Esc: skip"),
+                None if ui.installs_now => format!("{v} · Enter: install · Esc: skip"),
                 None => format!("{v} · Enter: update on quit · Esc: skip"),
             },
             update::State::Downloading(v) => format!("downloading {v}…"),
             update::State::Staged(v, _) => format!("{v} installs on quit"),
+            update::State::Installed(v) => format!("{v} installed · restart litty"),
             update::State::Failed(msg) => format!("update failed: {msg}  {key}"),
         })
+    }
+
+    /// Open or close the update prompt; a finished or failed update's notice is dismissed.
+    fn toggle_update_prompt(&mut self) {
+        self.set_update(|ui| match ui.state {
+            update::State::None => {}
+            update::State::Failed(_) | update::State::Installed(_) => ui.state = update::State::None,
+            _ => ui.open = !ui.open,
+        });
+    }
+
+    /// A click on the update notice works like its keys (Ubuntu's input method takes Ctrl+Shift+U).
+    fn click_update_notice(&mut self) -> bool {
+        let rect = self.active_rect();
+        let (Some(text), Some(r)) = (self.update_notice().filter(|_| self.flash.is_none()), &self.renderer) else { return false };
+        let (x, y, w, h) = r.notice_box(&text, rect);
+        let (cx, cy) = (self.cursor.0 as usize, self.cursor.1 as usize);
+        if self.term().lock().unwrap().recorder.is_some() || !(x..x + w).contains(&cx) || !(y..y + h).contains(&cy) {
+            return false;
+        }
+        let ready = { let ui = self.ui.borrow(); ui.open && matches!(ui.state, update::State::Available(_)) };
+        if ready {
+            install_update(&self.ui, &self.proxy);
+            self.notice_changed();
+        } else {
+            self.toggle_update_prompt();
+        }
+        true
     }
 
     /// Repaint the active tab so the notice appears, changes or disappears.
@@ -1322,6 +1684,11 @@ impl Win {
 
     fn on_key(&mut self, e: &KeyEvent) {
         let mods = self.mods;
+        match self.keybind(e) {
+            Some(Some(action)) => return self.run_action(action),
+            Some(None) => return self.send_key(e),
+            None => {}
+        }
         let cmd = mods.super_key() || (mods.control_key() && mods.shift_key());
         if mods.control_key() && matches!(e.logical_key, Key::Named(NamedKey::Tab)) {
             return self.cycle_tab(if mods.shift_key() { -1 } else { 1 });
@@ -1376,9 +1743,27 @@ impl Win {
                 _ => {}
             }
         }
-        let app_cursor = self.term().lock().unwrap().grid.app_cursor;
-        if let Some(bytes) = key_bytes(e, mods, app_cursor) {
+        self.send_key(e);
+    }
+
+    /// Send a key to the program in the focused pane.
+    fn send_key(&mut self, e: &KeyEvent) {
+        let (app_cursor, flags) = {
+            let t = self.term().lock().unwrap();
+            (t.grid.app_cursor, t.grid.kbd_flags())
+        };
+        if let Some(bytes) = kitty_bytes(e, self.mods, flags).or_else(|| key_bytes(e, self.mods, app_cursor)) {
             self.send_input(&bytes);
+        }
+    }
+
+    /// Key releases matter only to applications that asked for them (Kitty keyboard protocol).
+    fn on_key_release(&mut self, e: &KeyEvent) {
+        let flags = self.term().lock().unwrap().grid.kbd_flags();
+        if flags & kitty::EVENT_TYPES != 0 && !self.mods.super_key() {
+            if let Some(bytes) = kitty_bytes(e, self.mods, flags).filter(|b| !b.is_empty()) {
+                self.send(&bytes);
+            }
         }
     }
 
@@ -1426,6 +1811,9 @@ impl Win {
                     _ => {}
                 }
             }
+            return;
+        }
+        if code == 0 && pressed && self.click_update_notice() {
             return;
         }
         if code == 0 {
@@ -1755,6 +2143,7 @@ impl Win {
             }
             _ if self.tabs.is_empty() => {}
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => self.on_key(&event),
+            WindowEvent::KeyboardInput { event, .. } => self.on_key_release(&event),
             WindowEvent::Ime(Ime::Commit(text)) => self.send_input(text.as_bytes()),
             WindowEvent::MouseInput { state, button, .. } => self.on_mouse_button(state, button),
             WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(position.x, position.y),
@@ -1771,6 +2160,13 @@ struct App {
     initial_command: Vec<String>,
     ui: Rc<RefCell<UpdateUi>>,
     last_focus: Option<WindowId>,
+    /// Programs' own notifications (OSC 9 / 777) are held back until then, so a loop can't flood.
+    alert_after: Instant,
+    /// Quit was chosen (the session is saved): closing the windows must not clear it.
+    quitting: bool,
+    /// The quick terminal's window (macOS hotkey), if it was opened.
+    #[cfg(target_os = "macos")]
+    quick: Option<WindowId>,
     #[cfg(target_os = "macos")]
     tray: Option<macos::Tray>,
     /// The tray is wanted but not made yet; it is made shortly after the first frame, because
@@ -1812,6 +2208,7 @@ impl App {
                 match want {
                     Want::Tab(cwd) => self.add_window(el, &[], cwd, Some(id)),
                     Want::Window(cwd) => self.add_window(el, &[], cwd, None),
+                    Want::Quit => self.quit(),
                 }
             }
         }
@@ -1827,20 +2224,18 @@ impl App {
     /// Slow commands that finished since the last look. With no litty window in front, the Dock
     /// bounces, the hamster shows how it went and a notification says what finished.
     fn take_finished(&mut self, now: Instant) {
-        let mut done = Vec::new();
+        let (mut done, mut alerts) = (Vec::new(), Vec::new());
         for p in self.wins.values().flat_map(|w| w.tabs.iter().flat_map(|t| &t.panes)) {
             // Never wait for a busy parser: the result stays in the grid until the next look.
-            if let Some(f) = p.term.try_lock().ok().and_then(|mut t| t.grid.finished.take()) {
-                done.push((p.id, f));
+            if let Ok(mut t) = p.term.try_lock() {
+                done.extend(t.grid.finished.take().map(|f| (p.id, f)));
+                alerts.extend(t.grid.alert.take().map(|a| (p.id, a)));
             }
         }
-        if done.is_empty() || self.wins.values().any(|w| w.focused) {
+        if (done.is_empty() && alerts.is_empty()) || self.wins.values().any(|w| w.focused) {
             return;
         }
         for (pane, f) in done {
-            if let Some(win) = self.wins.values().find(|w| w.owns(pane)).and_then(|w| w.window.as_ref()) {
-                win.request_user_attention(Some(UserAttentionType::Informational));
-            }
             let title = f.command.unwrap_or_else(|| "Command finished".into());
             let body = match f.exit {
                 0 => format!("Done in {}", took_text(f.took)),
@@ -1849,16 +2244,28 @@ impl App {
             #[cfg(target_os = "macos")]
             {
                 self.tray_done = Some((f.exit == 0, now + Duration::from_secs(10)));
-                if let Some(n) = self.notifier.get_or_insert_with(macos::Notifier::new) {
-                    n.notify(pane, &title, &body);
-                }
             }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = (pane, now);
-                notify_send(&title, &body);
+            self.notify(pane, &title, &body);
+        }
+        for (pane, (title, body)) in alerts {
+            if now >= self.alert_after {
+                self.alert_after = now + Duration::from_secs(2);
+                self.notify(pane, &title, &body);
             }
         }
+    }
+
+    /// Bounce the Dock (or flash the taskbar) for `pane`'s window and post a desktop notification.
+    fn notify(&mut self, pane: usize, title: &str, body: &str) {
+        if let Some(win) = self.wins.values().find(|w| w.owns(pane)).and_then(|w| w.window.as_ref()) {
+            win.request_user_attention(Some(UserAttentionType::Informational));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(n) = self.notifier.get_or_insert_with(macos::Notifier::new) {
+            n.notify(pane, title, body);
+        }
+        #[cfg(not(target_os = "macos"))]
+        notify_send(title, body);
     }
 
     /// Check for updates now, because the user asked.
@@ -1890,7 +2297,7 @@ impl App {
             update::State::Downloading(_) => TrayMode::Loading,
             _ if done.is_some() => TrayMode::Done(done.is_some_and(|d| d.0)),
             _ if running.is_some_and(|t| t <= now) => TrayMode::Running,
-            update::State::Available(_) | update::State::Staged(..) => TrayMode::Update,
+            update::State::Available(_) | update::State::Staged(..) | update::State::Installed(_) => TrayMode::Update,
             _ => TrayMode::Idle,
         };
         if self.tray_generation != Some(ui.generation) {
@@ -1911,6 +2318,7 @@ impl App {
                 }
                 update::State::Downloading(new) => (format!("Downloading {new}…"), None),
                 update::State::Staged(new, _) => (format!("{new} installs when litty quits"), None),
+                update::State::Installed(new) => (format!("{new} installed, restart litty"), None),
                 update::State::Failed(msg) => (format!("Update failed: {msg}"), check),
             };
             tray.set_menu(&status, action);
@@ -1921,12 +2329,130 @@ impl App {
         next.into_iter().chain(running.filter(|&t| t > now)).chain(done.map(|d| d.1)).min()
     }
 
+    /// The quick terminal: a window across the top of the screen, shown and hidden by a hotkey.
+    #[cfg(target_os = "macos")]
+    fn toggle_quick(&mut self, el: &ActiveEventLoop) {
+        if let Some(w) = self.quick.and_then(|id| self.wins.get(&id)).and_then(|w| w.window.clone()) {
+            let shown = w.is_visible().unwrap_or(true);
+            if shown && w.has_focus() {
+                w.set_visible(false);
+                // With no other litty window in front, give the keyboard back to the previous app.
+                if !self.wins.values().any(|x| x.focused && x.window.as_ref().is_some_and(|x| x.id() != w.id())) {
+                    macos::activate(false);
+                }
+            } else {
+                w.set_visible(true);
+                macos::activate(true);
+                w.focus_window();
+            }
+            return;
+        }
+        self.add_window(el, &[], None, None);
+        let Some(id) = self.last_focus else { return };
+        self.quick = Some(id);
+        let Some(w) = self.wins.get(&id).and_then(|w| w.window.clone()) else { return };
+        if let Some(m) = w.current_monitor() {
+            let (pos, size) = (m.position(), m.size());
+            w.set_decorations(false);
+            w.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+            w.set_outer_position(pos);
+            let _ = w.request_inner_size(PhysicalSize::new(size.width, size.height * 2 / 5));
+        }
+        macos::activate(true);
+        w.focus_window();
+    }
+
+    /// Save the session, then close every window (the app exits when the last one goes).
+    fn quit(&mut self) {
+        self.save_session();
+        self.quitting = true;
+        let ids: Vec<WindowId> = self.wins.keys().copied().collect();
+        for id in ids {
+            self.close_window(id);
+        }
+    }
+
+    fn save_session(&self) {
+        if !config::get().restore || !self.initial_command.is_empty() {
+            return;
+        }
+        // Order windows (and on macOS the native tabs within a group) as they appear.
+        let mut wins: Vec<((usize, usize), &Win)> = self
+            .wins
+            .values()
+            .filter(|w| !self.is_quick(w))
+            .map(|w| {
+                #[cfg(target_os = "macos")]
+                let place = w.window.as_deref().map_or((0, 0), macos::tab_position);
+                #[cfg(not(target_os = "macos"))]
+                let place = (w.window.as_ref().map_or(0, |w| u64::from(w.id()) as usize), 0);
+                (place, w)
+            })
+            .collect();
+        wins.sort_by_key(|(place, _)| *place);
+        let mut groups = Vec::new();
+        let tabs: Vec<session::TabState> = wins
+            .iter()
+            .flat_map(|((group, _), w)| {
+                let n = groups.iter().position(|g| g == group).unwrap_or_else(|| {
+                    groups.push(*group);
+                    groups.len() - 1
+                });
+                w.session_tabs(n)
+            })
+            .collect();
+        session::save(&tabs);
+    }
+
+    /// Reopen the session saved at the last Quit; false if there was none.
+    fn restore_session(&mut self, el: &ActiveEventLoop) -> bool {
+        let saved = session::take();
+        if saved.is_empty() {
+            return false;
+        }
+        // The window each group became: tabs of a group join it (a native tab on macOS).
+        let mut group_win: Vec<(usize, WindowId)> = Vec::new();
+        for tab in &saved {
+            let dir = tab.layout.first_dir().map(String::from);
+            let joined = group_win.iter().find(|(g, _)| *g == tab.group).map(|(_, id)| *id);
+            let id = match joined {
+                #[cfg(not(target_os = "macos"))]
+                Some(id) => {
+                    let Some(w) = self.wins.get_mut(&id) else { continue };
+                    w.new_tab(&[], dir);
+                    id
+                }
+                join => {
+                    self.add_window(el, &[], dir, join);
+                    let Some(id) = self.last_focus else { continue };
+                    group_win.push((tab.group, id));
+                    id
+                }
+            };
+            if let Some(w) = self.wins.get_mut(&id) {
+                w.restore_tab(tab);
+            }
+        }
+        !self.wins.is_empty()
+    }
+
     fn close_window(&mut self, id: WindowId) {
         if let Some(mut w) = self.wins.remove(&id) {
             w.shutdown();
-            if self.wins.is_empty() {
+            if self.wins.is_empty() && !self.is_quick(&w) {
                 w.save_state();
             }
+        }
+    }
+
+    /// Whether `w` is the quick terminal (its size and place are not the user's normal window).
+    fn is_quick(&self, w: &Win) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.quick.is_some() && w.window.as_ref().map(|x| x.id()) == self.quick;
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = w;
+            false
         }
     }
 }
@@ -1940,7 +2466,9 @@ impl ApplicationHandler<Ev> for App {
         #[cfg(target_os = "macos")]
         el.set_allows_automatic_window_tabbing(false);
         let command = self.initial_command.clone();
-        self.add_window(el, &command, None, None);
+        if !command.is_empty() || !config::get().restore || !self.restore_session(el) {
+            self.add_window(el, &command, None, None);
+        }
         if command.is_empty() && update::enabled() {
             let proxy = self.proxy.clone();
             std::thread::spawn(move || update::check(false, |e| drop(proxy.send_event(Ev::Update(e)))));
@@ -1950,6 +2478,11 @@ impl ApplicationHandler<Ev> for App {
             self.tray_wanted = config::get().tray;
             let proxy = Mutex::new(self.proxy.clone());
             macos::set_sink(Box::new(move |a| drop(proxy.lock().unwrap().send_event(Ev::Tray(a)))));
+            if let Some((mods, key)) = &config::get().quick_terminal {
+                if !macos::key_code(key).is_some_and(|code| macos::register_hotkey(code, *mods)) {
+                    eprintln!("litty: can't use quick-terminal = {key} (key or combination unavailable)");
+                }
+            }
         }
     }
 
@@ -2007,9 +2540,11 @@ impl ApplicationHandler<Ev> for App {
                     ui.state = match e {
                         update::Event::Found(v) => {
                             ui.managed = update::managed_by();
+                            ui.installs_now = update::installs_now();
                             update::State::Available(v)
                         }
                         update::Event::Staged(v, path) => update::State::Staged(v, path),
+                        update::Event::Installed(v) => update::State::Installed(v),
                         update::Event::Failed(msg) => update::State::Failed(msg),
                         update::Event::Current => update::State::None,
                     };
@@ -2031,12 +2566,8 @@ impl ApplicationHandler<Ev> for App {
                             }
                         }
                     }
-                    macos::TrayAction::Quit => {
-                        let ids: Vec<WindowId> = self.wins.keys().copied().collect();
-                        for id in ids {
-                            self.close_window(id);
-                        }
-                    }
+                    macos::TrayAction::Quit => self.quit(),
+                    macos::TrayAction::Quick => self.toggle_quick(el),
                 }
                 self.settle(el, None);
             }
@@ -2044,9 +2575,16 @@ impl ApplicationHandler<Ev> for App {
     }
 
     fn exiting(&mut self, _: &ActiveEventLoop) {
-        let last = self.last_focus.and_then(|id| self.wins.get(&id)).or_else(|| self.wins.values().next());
+        let last = self.last_focus.and_then(|id| self.wins.get(&id)).filter(|w| !self.is_quick(w)).or_else(|| self.wins.values().find(|w| !self.is_quick(w)));
         if let Some(w) = last {
             w.save_state();
+        }
+        // Quitting with windows open (Cmd+Q) keeps them for next time; closing the last window
+        // by hand starts fresh. `litty -e cmd` runs leave the saved session alone.
+        if !self.wins.is_empty() {
+            self.save_session();
+        } else if !self.quitting && self.initial_command.is_empty() {
+            session::clear();
         }
         let staged = match &self.ui.borrow().state {
             update::State::Staged(_, path) => Some(path.clone()),
@@ -2083,7 +2621,7 @@ impl ApplicationHandler<Ev> for App {
 }
 
 fn main() {
-    theme::init(config::get().light);
+    theme::init(config::get().light, &config::get().colors);
     // Launched from Finder or the Dock the working directory is "/": start in the home directory.
     if std::env::current_dir().is_ok_and(|d| d == std::path::Path::new("/")) {
         if let Some(home) = std::env::var_os("HOME") {
@@ -2104,6 +2642,10 @@ fn main() {
         initial_command,
         ui: Rc::new(RefCell::new(UpdateUi::default())),
         last_focus: None,
+        alert_after: Instant::now(),
+        quitting: false,
+        #[cfg(target_os = "macos")]
+        quick: None,
         #[cfg(target_os = "macos")]
         tray: None,
         #[cfg(target_os = "macos")]

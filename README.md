@@ -40,35 +40,63 @@ litty needs no configuration. To change a default, create `~/.config/litty/confi
     cursor = block        # block | bar | underline
     cursor-blink = false
     tray = true           # macOS menu-bar hamster; false removes it
+    font = JetBrains Mono # a family name or a path to the regular .ttf/.otf
+    padding = 10          # points around the text
+    scrollback = 20000    # lines kept per pane (up to 200000)
+    background = #1a1b26  # also foreground, selection, cursor-color, color0 … color15
+    keybind = ctrl+shift+k = split-right   # or `= none` to pass the keys to the program
+    restore = true        # reopen the tabs, splits and folders open at Quit
+    quick-terminal = ctrl+`   # macOS: a system-wide key that drops a terminal from the top
+    term = xterm-litty    # TERM for programs (default xterm-256color; see below)
 
-Changes apply the next time litty starts.
+Keybind actions: copy, paste, copy-output, new-tab, new-window, close, split-right, split-down,
+find, clear, zoom-in, zoom-out, zoom-reset, next-tab, prev-tab, next-pane, prev-pane,
+prev-prompt, next-prompt, toggle-zoom, record, update. Changes apply the next time litty starts.
+
+`term = xterm-litty` tells programs about litty's extras (undercurl, truecolor, synchronized
+output) through its own terminfo entry, installed with the packages and the app. TERM stays
+`xterm-256color` by default because hosts you ssh into don't have the entry; copy it there with
+`infocmp -x xterm-litty | ssh host tic -x -`. Programs can also check `TERM_PROGRAM=litty`.
 
 ## Terminal features
 
-Truecolor, 256 colours, bold/italic/underline, wide characters and combining marks (Thai), colour
-emoji (single code points: ZWJ sequences, skin tones and flags show their parts), mouse reporting
-(SGR), bracketed paste, focus events (1004), synchronized output (2026), OSC 7/8/52/133, colour
-queries (OSC 4/10/11/12) and DECRQM mode queries, DSR, alternate screen, scrollback with reflow.
-Not supported yet: images (sixel / Kitty graphics) and the Kitty keyboard protocol (queries are
-answered as "no enhancements").
+Truecolor, 256 colours, bold/italic, underline styles (single, double, curly, dotted, dashed) and
+colours (SGR 4:n, 58), wide characters and combining marks (Thai), colour emoji including flags,
+skin tones and ZWJ sequences (drawn over the cells programs count, so the cursor never drifts),
+mouse reporting (SGR), bracketed paste, focus events (1004), synchronized output (2026),
+OSC 7/8/52/133, notifications (OSC 9, OSC 777), colour queries (OSC 4/10/11/12), DECRQM, DSR,
+XTWINOPS size reports, alternate screen, scrollback with reflow.
+
+- **Images:** the Kitty graphics protocol (PNG, RGB, RGBA; inline, file or temporary file),
+  as used by `kitten icat`, chafa, timg, yazi and image.nvim. Images scroll with their text and
+  each pane keeps at most 64 MB of them. Not yet: sixel, shared memory, Unicode placeholders.
+- **Kitty keyboard protocol** (all five enhancement flags), so neovim, helix and fish can tell
+  Ctrl+I from Tab, see key releases and so on.
+- **VT100/VT220 details** checked with vttest: insert mode, autowrap off, origin mode, reverse
+  screen, settable tab stops, DEC line drawing, cursor save with attributes, DECALN, RIS.
+  132-column mode clears the screen but keeps the window size (like xterm by default).
+- **Fonts:** a missing character is looked up in fontconfig (CJK, Hangul, Indic …) when the
+  built-in list has no font for it.
 
 ## Updates
 
 litty checks for a newer release when it starts, at most once an hour (a single request to GitHub; turn it off with
 `LITTY_NO_UPDATE_CHECK=1`). When one exists a small `↑ litty x.y.z` notice appears in the corner of the
-window. Press Cmd+Shift+U (Ctrl+Shift+U on Linux) to open it: Enter downloads the release in the
-background and installs it when you quit, Esc skips that version. Downloads are verified with an
-ed25519 signature before anything is replaced. If a package manager installed litty (Homebrew, apt,
-Nix, cargo), the notice shows the command to run instead and Enter copies it.
+window. Click it or press Cmd+Shift+U (Ctrl+Shift+U on Linux) to open it: Enter downloads the release in the
+background and installs it when you quit, Esc skips that version. If litty came from the .deb or .rpm,
+Enter downloads the new package and installs it right away (the system asks for your password), and
+the next launch runs it. Downloads are verified with an ed25519 signature before anything is replaced.
+If another package manager installed litty (Homebrew, Nix, cargo), the notice shows the command to
+run instead and Enter copies it.
 
 On macOS a small hamster sits in the menu bar. It runs in its wheel while a command is running in
-any tab (zsh, or any shell that emits OSC 133), and stuffs its cheeks while an update downloads; a
+any tab (zsh, bash, fish, or any shell that emits OSC 133), and stuffs its cheeks while an update downloads; a
 blue dot means an update is ready. Its menu can check for updates, install one, open a window or
 quit. When nothing is happening it stays still and costs no CPU.
 
 ## What makes it different
 
-- **Command blocks.** With zsh (auto-enabled) or any shell that emits OSC 133, failed commands
+- **Command blocks.** With zsh, bash (4.4+ for command names) or fish (all auto-enabled) or any shell that emits OSC 133, failed commands
   get a faint red tint on their output, and slow or failing commands show `exit N  1.2s` at the
   end of the command line. Cmd+Up / Cmd+Down jump between prompts. Cmd+Shift+C copies the last
   command's output (without the prompt); Cmd-click a prompt to select that command's output.
@@ -76,6 +104,7 @@ quit. When nothing is happening it stays still and costs no CPU.
   background, the Dock icon bounces, the menu-bar hamster cheers (exit 0) or looks dizzy (failure),
   and a notification says what finished and how long it took ("cargo build — Done in 2m13s").
   Clicking it brings you to that tab. On Linux the notification goes through `notify-send`.
+  Programs can post their own the same way with OSC 9 or OSC 777 (at most one every 2 s).
 - **Thai word selection.** Thai is written without spaces, so double-clicking Thai text picks the
   dictionary word under the pointer instead of the whole line (maximal matching over PyThaiNLP's
   CC0 word list, loaded on first use).
@@ -93,7 +122,8 @@ quit. When nothing is happening it stays still and costs no CPU.
   matches appear as ticks. Click or drag it to jump.
 - **Find** (Cmd+F): highlights every match, Enter / Shift+Enter to step, Esc to close.
 - **Links:** hold Cmd (Ctrl on Linux) and click a URL.
-- **Maple Mono NF** (rounded, with Nerd Font icons and powerline glyphs) is used automatically when installed in `~/Library/Fonts`, `~/.local/share/fonts` or `~/.fonts` (files `MapleMono-NF-{Regular,Bold,Italic,BoldItalic}.ttf`, SIL OFL); otherwise Menlo / DejaVu Sans Mono.
+- **Maple Mono NF** (rounded, with Nerd Font icons and powerline glyphs) is used automatically when installed in `~/Library/Fonts`, `~/.local/share/fonts` or `~/.fonts`, or a folder inside them (files `MapleMono-NF-{Regular,Bold,Italic,BoldItalic}.ttf`, SIL OFL); otherwise Menlo / DejaVu Sans Mono.
+- **Nerd Font icons** work with any font: litty has Symbols Nerd Font Mono (MIT) built in, and draws powerline arrows to fill the cell.
 - Correct Thai (tone marks and vowels stack on the base letter), procedural box drawing,
   bold/italic/underline, truecolor, 20k lines of compact scrollback.
 
@@ -114,6 +144,7 @@ quit. When nothing is happening it stays still and costs no CPU.
 | Cmd+Shift+R | Start / stop recording the pane (asciinema) |
 | Cmd+K | Clear screen and scrollback |
 | Cmd+N | New window |
+| Cmd+Q | Quit, keeping tabs and splits for next time (Ctrl+Shift+Q on Linux) |
 | Cmd+F | Find |
 | Cmd+Up / Down | Previous / next prompt |
 | Cmd+Left / Right / Backspace | Start of line / end of line / delete line |

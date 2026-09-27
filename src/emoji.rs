@@ -1,6 +1,6 @@
 //! Colour emoji from the system's bitmap emoji font (Apple Color Emoji `sbix` on macOS, Noto
-//! Color Emoji `CBDT` on Linux). Only single-codepoint emoji: sequences (ZWJ, skin tones, flags)
-//! show their parts.
+//! Color Emoji `CBDT` on Linux). Sequences (flags, skin tones, ZWJ families) are shaped with
+//! the font into the one picture it has for them.
 
 use crate::font::font_data;
 use std::collections::HashMap;
@@ -22,7 +22,13 @@ pub struct Bitmap {
 #[derive(Default)]
 pub struct Emoji {
     face: Option<Option<Face<'static>>>,
+    shaper: Option<Option<rustybuzz::Face<'static>>>,
     cache: HashMap<(char, usize), Option<Bitmap>>,
+    sequences: HashMap<(String, usize), Option<Bitmap>>,
+}
+
+fn font() -> Option<&'static [u8]> {
+    FONTS.iter().find_map(|p| font_data(p))
 }
 
 impl Emoji {
@@ -35,12 +41,38 @@ impl Emoji {
         self.cache[&(ch, side)].as_ref()
     }
 
+    /// The picture for an emoji sequence, if the font has one glyph for the whole of it.
+    pub fn sequence(&mut self, seq: &str, side: usize) -> Option<&Bitmap> {
+        let key = (seq.to_string(), side);
+        if !self.sequences.contains_key(&key) {
+            let bmp = self.load_sequence(seq, side);
+            self.sequences.insert(key.clone(), bmp);
+        }
+        self.sequences[&key].as_ref()
+    }
+
+    fn load_sequence(&mut self, seq: &str, side: usize) -> Option<Bitmap> {
+        let shaper = self.shaper.get_or_insert_with(|| font().and_then(|d| rustybuzz::Face::from_slice(d, 0))).as_ref()?;
+        let mut buf = rustybuzz::UnicodeBuffer::new();
+        buf.push_str(seq);
+        let out = rustybuzz::shape(shaper, &[], buf);
+        let [glyph] = out.glyph_infos() else { return None };
+        self.raster(ttf_parser::GlyphId(glyph.glyph_id as u16), side)
+    }
+
     fn load(&mut self, ch: char, side: usize) -> Option<Bitmap> {
-        let face = self
-            .face
-            .get_or_insert_with(|| FONTS.iter().find_map(|p| font_data(p)).and_then(|d| Face::parse(d, 0).ok()))
-            .as_ref()?;
-        let img = face.glyph_raster_image(face.glyph_index(ch)?, side.min(u16::MAX as usize) as u16)?;
+        let id = self.face()?.glyph_index(ch)?;
+        self.raster(id, side)
+    }
+
+    fn face(&mut self) -> Option<&Face<'static>> {
+        self.face.get_or_insert_with(|| font().and_then(|d| Face::parse(d, 0).ok())).as_ref()
+    }
+
+    fn raster(&mut self, id: ttf_parser::GlyphId, side: usize) -> Option<Bitmap> {
+        let face = self.face()?;
+        // Some glyphs are missing from some strikes (sizes): then take the largest and scale it.
+        let img = face.glyph_raster_image(id, side.min(u16::MAX as usize) as u16).or_else(|| face.glyph_raster_image(id, u16::MAX))?;
         if img.format != RasterImageFormat::PNG {
             return None;
         }

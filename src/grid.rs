@@ -9,8 +9,15 @@ pub const UNDERLINE: u8 = 4;
 /// Set on the last cell of a row whose text continues on the next row (soft wrap), so resizing
 /// can re-join and re-wrap lines.
 pub const WRAPPED: u8 = 8;
+/// Underline style (SGR 4:n) when UNDERLINE is set: 0 single, 1 double, 2 curly, 3 dotted, 4 dashed.
+pub const UL_STYLE: u8 = 0x70;
+pub const UL_SHIFT: u8 = 4;
+/// The cell's `ul` holds an underline colour (SGR 58); otherwise the underline takes the text colour.
+pub const UL_COLOR: u8 = 0x80;
 
-const HISTORY_CAP: usize = 20_000;
+/// Kitty keyboard flags litty implements: disambiguate, event types, alternate keys, all keys as
+/// escape codes, associated text.
+const KBD_FLAGS: u8 = 31;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum CursorShape {
@@ -47,13 +54,27 @@ pub struct Finished {
 /// Commands slower than this ask for attention if the window is in the background.
 const LONG_COMMAND: Duration = Duration::from_secs(8);
 
-/// `n` consecutive cells sharing one style.
-#[derive(Clone, Copy)]
+/// `n` consecutive cells sharing one style. Colours use 24 bits, so the underline colour's red and
+/// green ride in the top bytes of `fg` and `bg` and blue in `ul_b`: a Run stays 12 bytes.
+#[derive(Clone, Copy, PartialEq)]
 struct Run {
     n: u16,
     fg: u32,
     bg: u32,
     attrs: u8,
+    ul_b: u8,
+}
+
+impl Run {
+    fn of(c: &Cell) -> Run {
+        let [r, g, b] = c.ul;
+        Run { n: 1, fg: c.fg | (r as u32) << 24, bg: c.bg | (g as u32) << 24, attrs: c.attrs, ul_b: b }
+    }
+
+    /// (fg, bg, attrs, ul) as stored in a Cell.
+    fn style(&self) -> (u32, u32, u8, [u8; 3]) {
+        (self.fg & 0xffffff, self.bg & 0xffffff, self.attrs, [(self.fg >> 24) as u8, (self.bg >> 24) as u8, self.ul_b])
+    }
 }
 
 /// A scrolled-off line stored as text plus style runs: ~10x smaller than a `Vec<Cell>`.
@@ -72,15 +93,16 @@ impl HLine {
                 self.text.push(c.ch);
                 self.text.extend(c.comb.iter().filter(|&&m| m != '\0'));
             }
+            let run = Run::of(c);
             match self.runs.last_mut() {
-                Some(r) if (r.fg, r.bg, r.attrs) == (c.fg, c.bg, c.attrs) => r.n += 1,
-                _ => self.runs.push(Run { n: 1, fg: c.fg, bg: c.bg, attrs: c.attrs }),
+                Some(r) if Run { n: r.n, ..run } == *r => r.n += 1,
+                _ => self.runs.push(run),
             }
         }
     }
 
     fn decode(&self, out: &mut Vec<Cell>) {
-        let mut styles = self.runs.iter().flat_map(|r| std::iter::repeat_n((r.fg, r.bg, r.attrs), r.n as usize));
+        let mut styles = self.runs.iter().flat_map(|r| std::iter::repeat_n(r.style(), r.n as usize));
         let mut base = None;
         for ch in self.text.chars() {
             if ch.width() == Some(0) {
@@ -92,12 +114,12 @@ impl HLine {
                 }
                 continue;
             }
-            let (fg, bg, attrs) = styles.next().unwrap_or((def_fg(), def_bg(), 0));
+            let (fg, bg, attrs, ul) = styles.next().unwrap_or((def_fg(), def_bg(), 0, [0; 3]));
             base = Some(out.len());
-            out.push(Cell { ch, comb: ['\0'; 2], fg, bg, attrs });
+            out.push(Cell { ch, comb: ['\0'; 2], fg, bg, attrs, ul });
             if ch.width() == Some(2) {
-                let (fg, bg, attrs) = styles.next().unwrap_or((def_fg(), def_bg(), 0));
-                out.push(Cell { ch: '\0', comb: ['\0'; 2], fg, bg, attrs });
+                let (fg, bg, attrs, ul) = styles.next().unwrap_or((def_fg(), def_bg(), 0, [0; 3]));
+                out.push(Cell { ch: '\0', comb: ['\0'; 2], fg, bg, attrs, ul });
             }
         }
     }
@@ -154,11 +176,18 @@ pub struct Cell {
     pub fg: u32,
     pub bg: u32,
     pub attrs: u8,
+    /// Underline colour as RGB bytes when `attrs` has UL_COLOR (fits in padding: a Cell stays 24 bytes).
+    pub ul: [u8; 3],
 }
 
 impl Cell {
     fn blank(fg: u32, bg: u32) -> Self {
-        Cell { ch: ' ', comb: ['\0'; 2], fg, bg, attrs: 0 }
+        Cell { ch: ' ', comb: ['\0'; 2], fg, bg, attrs: 0, ul: [0; 3] }
+    }
+
+    /// The underline colour: SGR 58 if set, else `fg` (the drawn text colour).
+    pub fn underline_color(&self, fg: u32) -> u32 {
+        if self.attrs & UL_COLOR == 0 { fg } else { u32::from_be_bytes([0, self.ul[0], self.ul[1], self.ul[2]]) }
     }
 }
 
@@ -197,6 +226,10 @@ pub struct Grid {
     pub mouse: u8,
     pub mouse_sgr: bool,
     pub in_alt: bool,
+    /// Tab stops by column (every 8 columns until a program sets its own with HTS / TBC).
+    tabs: Vec<bool>,
+    /// Kitty keyboard protocol flags, a stack per screen (main, alternate); the base entry stays.
+    kbd: [Vec<u8>; 2],
     /// Lines scrolled back from the live screen (0 = live).
     pub scroll: usize,
     /// Total lines ever pushed to history; gives lines a stable absolute id.
@@ -210,13 +243,36 @@ pub struct Grid {
     pub cur_match: usize,
     /// Set when a long command finishes; taken by the app.
     pub finished: Option<Finished>,
+    /// Images (Kitty graphics protocol) and where they are shown.
+    pub graphics: crate::graphics::Graphics,
+    /// Cell size in pixels, for placing images at their natural size (set by the window).
+    pub cell_px: (usize, usize),
+    /// A notification a program asked for (OSC 9 or OSC 777): (title, body); taken by the app.
+    pub alert: Option<(String, String)>,
     pen_fg: u32,
     pen_bg: u32,
     pen_rev: bool,
     pen_attrs: u8,
+    pen_ul: [u8; 3],
+    /// The last printed character, for REP (CSI b).
+    last_char: Option<char>,
     top: usize,
     bot: usize,
     saved: (usize, usize),
+    /// Pen and origin mode saved with the cursor (DECSC): fg, bg, reverse, attrs, underline colour.
+    saved_pen: (u32, u32, bool, u8, [u8; 3], bool),
+    /// DECAWM: printing past the last column wraps (on) or overwrites the last column (off).
+    autowrap: bool,
+    /// DECOM: cursor addressing is relative to the scroll region.
+    origin: bool,
+    /// IRM: printed characters push the rest of the line right.
+    insert: bool,
+    /// DECSCNM: the whole screen is drawn in reverse video.
+    pub reverse_screen: bool,
+    /// G0 and G1 are DEC Special Graphics (line drawing) instead of ASCII; `shift_out` selects G1.
+    line_drawing: [bool; 2],
+    shift_out: bool,
+    saved_charset: ([bool; 2], bool),
     alt_cells: Vec<Cell>,
     /// Ring-buffer origin: logical row `y` lives at physical row `(off + y) % rows`, so
     /// scrolling the whole screen only moves this offset instead of the cells.
@@ -260,6 +316,8 @@ impl Grid {
             mouse: 0,
             mouse_sgr: false,
             in_alt: false,
+            kbd: [vec![0], vec![0]],
+            tabs: default_tabs(cols),
             scroll: 0,
             pushed: 0,
             sel: None,
@@ -268,13 +326,26 @@ impl Grid {
             matches: Vec::new(),
             cur_match: 0,
             finished: None,
+            alert: None,
+            graphics: Default::default(),
+            cell_px: (10, 20),
             pen_fg: def_fg(),
             pen_bg: def_bg(),
             pen_rev: false,
             pen_attrs: 0,
+            pen_ul: [0; 3],
+            last_char: None,
             top: 0,
             bot: rows,
             saved: (0, 0),
+            saved_pen: (def_fg(), def_bg(), false, 0, [0; 3], false),
+            autowrap: true,
+            origin: false,
+            insert: false,
+            reverse_screen: false,
+            line_drawing: [false; 2],
+            shift_out: false,
+            saved_charset: ([false; 2], false),
             alt_cells: vec![blank; cols * rows],
             off: 0,
             alt_off: 0,
@@ -286,6 +357,11 @@ impl Grid {
         if (cols, rows) == (self.cols, self.rows) {
             self.dirty.fill(true);
             return;
+        }
+        let old = self.tabs.len();
+        self.tabs.resize(cols, false);
+        for x in old..cols {
+            self.tabs[x] = x % 8 == 0;
         }
         if !self.in_alt {
             self.reflow(cols, rows);
@@ -399,12 +475,16 @@ impl Grid {
             m.out = m.out.map(remap);
             m.end = m.end.map(remap);
         }
+        for p in self.graphics.placements.iter_mut().filter(|p| !p.alt) {
+            p.line = remap(p.line);
+        }
 
         // Keep the cursor on screen: rows above overflow into scrollback.
         let drop = total.saturating_sub(rows).min(cursor.0);
         for row in &out[..drop] {
             Self::push_line(&mut self.history, &mut self.pushed, &mut self.marks, &mut self.scroll, row);
         }
+        self.forget_old_images();
         let mut cells = Vec::with_capacity(cols * rows);
         for r in drop..drop + rows {
             match out.get(r) {
@@ -444,6 +524,37 @@ impl Grid {
         let i = self.at(r, 0);
         let row = &self.cells[i..i + self.cols];
         Self::push_line(&mut self.history, &mut self.pushed, &mut self.marks, &mut self.scroll, row);
+        self.forget_old_images();
+    }
+
+    /// Images on lines that have left scrollback go with them.
+    fn forget_old_images(&mut self) {
+        if !self.graphics.placements.is_empty() {
+            self.graphics.forget_before(self.pushed - self.history.len() as u64);
+        }
+    }
+
+    /// A Kitty graphics command (APC `G…`): store the image, show it at the cursor, reply.
+    pub fn apc(&mut self, payload: &[u8]) {
+        let Some(out) = self.graphics.command(payload) else { return };
+        if let Some(reply) = out.reply {
+            self.reply.extend(reply.as_bytes());
+        }
+        let Some((image, keys)) = out.place else { return };
+        self.cx = self.cx.min(self.cols - 1);
+        let line = self.pushed + self.cy as u64;
+        let (cols, rows) = self.graphics.place(image, &keys, line, self.cx, self.cell_px, self.in_alt);
+        let first = self.cy;
+        if !keys.no_move {
+            // Like kitty: the cursor ends after the image's last column, on its last row.
+            for _ in 1..rows {
+                self.newline();
+            }
+            self.cx = (self.cx + cols).min(self.cols);
+        }
+        for y in first.saturating_sub(rows)..self.rows {
+            self.dirty[y] = true;
+        }
     }
 
     /// Append `row` to scrollback (associated fn so callers can borrow `cells` at the same time).
@@ -451,9 +562,13 @@ impl Grid {
         // Drop trailing blanks so history stays small for typical short lines.
         let len = row.iter().rposition(|x| !(x.ch == ' ' && x.bg == def_bg() && x.attrs & UNDERLINE == 0)).map_or(0, |i| i + 1);
         // At capacity, recycle the evicted line's allocation.
-        let mut line = if history.len() == HISTORY_CAP { history.pop_front().unwrap_or_default() } else { HLine::default() };
+        let cap = crate::config::get().scrollback;
+        let mut line = if history.len() >= cap { history.pop_front().unwrap_or_default() } else { HLine::default() };
         line.encode(&row[..len]);
         history.push_back(line);
+        while history.len() > cap {
+            history.pop_front();
+        }
         *pushed += 1;
         let base = *pushed - history.len() as u64;
         while marks.front().is_some_and(|m| m.start < base) {
@@ -543,6 +658,7 @@ impl Grid {
     }
 
     /// When the command that is still running (OSC 133 C without D yet) started.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn running_since(&self) -> Option<Instant> {
         self.marks.back().filter(|m| m.end.is_none()).and_then(|m| m.started)
     }
@@ -728,6 +844,7 @@ impl Grid {
     /// blocks that pointed at them must go (keeps `marks` sorted and unambiguous).
     fn forget_screen_marks(&mut self) {
         let live = self.pushed;
+        self.graphics.clear_lines(self.in_alt, live, live + self.rows as u64);
         self.marks.retain(|m| m.start < live);
         for m in &mut self.marks {
             if m.end.is_some_and(|e| e > live) {
@@ -854,14 +971,15 @@ impl Grid {
         }
         self.in_alt = on;
         self.scroll = 0;
+        self.graphics.clear_lines(true, 0, u64::MAX);
         std::mem::swap(&mut self.cells, &mut self.alt_cells);
         std::mem::swap(&mut self.off, &mut self.alt_off);
         if on {
-            self.saved = (self.cx, self.cy);
+            self.save_cursor();
             let blank = Cell::blank(def_fg(), def_bg());
             self.cells.fill(blank);
         } else {
-            (self.cx, self.cy) = self.saved;
+            self.restore_cursor();
         }
         self.dirty.fill(true);
     }
@@ -876,13 +994,12 @@ impl Grid {
             if s.len() > 1 {
                 // Colon-separated sub-parameters: 38:2::r:g:b, 48:5:n, 4:3.
                 match s[0] {
-                    38 | 48 => {
+                    38 | 48 | 58 => {
                         if let Some(col) = colon_color(s) {
-                            if s[0] == 38 { self.pen_fg = col } else { self.pen_bg = col }
+                            self.set_color(s[0], col);
                         }
                     }
-                    4 if s[1] == 0 => self.pen_attrs &= !UNDERLINE,
-                    4 => self.pen_attrs |= UNDERLINE,
+                    4 => self.set_underline(s[1]),
                     _ => {}
                 }
                 continue;
@@ -892,11 +1009,12 @@ impl Grid {
                 0 => self.reset_pen(),
                 1 => self.pen_attrs |= BOLD,
                 3 => self.pen_attrs |= ITALIC,
-                4 => self.pen_attrs |= UNDERLINE,
+                4 => self.set_underline(1),
                 7 => self.pen_rev = true,
+                21 => self.set_underline(2),
                 22 => self.pen_attrs &= !BOLD,
                 23 => self.pen_attrs &= !ITALIC,
-                24 => self.pen_attrs &= !UNDERLINE,
+                24 => self.set_underline(0),
                 27 => self.pen_rev = false,
                 30..=37 => self.pen_fg = ansi()[(c - 30) as usize],
                 39 => self.pen_fg = def_fg(),
@@ -904,18 +1022,111 @@ impl Grid {
                 49 => self.pen_bg = def_bg(),
                 90..=97 => self.pen_fg = ansi()[(c - 90) as usize + 8],
                 100..=107 => self.pen_bg = ansi()[(c - 100) as usize + 8],
-                38 | 48 => {
+                38 | 48 | 58 => {
                     if let Some(col) = extended_color(&mut it.by_ref().map(|s| s[0])) {
-                        if c == 38 { self.pen_fg = col } else { self.pen_bg = col }
+                        self.set_color(c, col);
                     }
                 }
+                59 => self.pen_attrs &= !UL_COLOR,
                 _ => {}
             }
         }
     }
 
+    /// SGR 38 / 48 / 58: text, background or underline colour.
+    fn set_color(&mut self, which: u16, col: u32) {
+        match which {
+            38 => self.pen_fg = col,
+            48 => self.pen_bg = col,
+            _ => {
+                let [_, r, g, b] = col.to_be_bytes();
+                self.pen_ul = [r, g, b];
+                self.pen_attrs |= UL_COLOR;
+            }
+        }
+    }
+
+    /// SGR 4:n: 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed (unknown styles: single).
+    fn set_underline(&mut self, n: u16) {
+        self.pen_attrs &= !(UNDERLINE | UL_STYLE);
+        if n > 0 {
+            let style = if n <= 5 { n as u8 - 1 } else { 0 };
+            self.pen_attrs |= UNDERLINE | style << UL_SHIFT;
+        }
+    }
+
+    /// The Kitty keyboard protocol flags in effect on the current screen.
+    pub fn kbd_flags(&self) -> u8 {
+        *self.kbd[self.in_alt as usize].last().expect("base entry")
+    }
+
+    /// Forward to the n-th next tab stop (every 8 columns), stopping at the last column.
+    fn tab(&mut self, n: usize) {
+        for _ in 0..n {
+            self.cx = (self.cx + 1..self.cols).find(|&x| self.tabs[x]).unwrap_or(self.cols - 1);
+        }
+    }
+
+    /// Back to the n-th previous tab stop (CBT).
+    fn back_tab(&mut self, n: usize) {
+        for _ in 0..n {
+            self.cx = (0..self.cx).rev().find(|&x| self.tabs[x]).unwrap_or(0);
+        }
+    }
+
     fn reset_pen(&mut self) {
         (self.pen_fg, self.pen_bg, self.pen_rev, self.pen_attrs) = (def_fg(), def_bg(), false, 0);
+    }
+
+    /// RIS: back to the power-on state (screen, modes, pen, tab stops, character sets); scrollback
+    /// and the window title are kept.
+    fn full_reset(&mut self) {
+        self.set_alt(false);
+        self.graphics.placements.clear();
+        self.reset_pen();
+        self.erase(0, self.cols * self.rows);
+        (self.top, self.bot) = (0, self.rows);
+        (self.autowrap, self.origin, self.insert, self.reverse_screen) = (true, false, false, false);
+        (self.line_drawing, self.shift_out) = ([false; 2], false);
+        (self.app_cursor, self.cursor_visible, self.mouse, self.mouse_sgr) = (false, true, 0, false);
+        (self.bracketed_paste, self.focus_events) = (false, false);
+        (self.cursor_shape, self.cursor_blink) = default_cursor();
+        self.kbd = [vec![0], vec![0]];
+        self.tabs = default_tabs(self.cols);
+        self.saved = (0, 0);
+        self.home();
+        self.dirty.fill(true);
+    }
+
+    /// DECSC: cursor position, pen, character sets and origin mode.
+    fn save_cursor(&mut self) {
+        self.saved = (self.cx, self.cy);
+        self.saved_charset = (self.line_drawing, self.shift_out);
+        self.saved_pen = (self.pen_fg, self.pen_bg, self.pen_rev, self.pen_attrs, self.pen_ul, self.origin);
+    }
+
+    /// DECRC.
+    fn restore_cursor(&mut self) {
+        (self.cx, self.cy) = (self.saved.0.min(self.cols - 1), self.saved.1.min(self.rows - 1));
+        (self.line_drawing, self.shift_out) = self.saved_charset;
+        (self.pen_fg, self.pen_bg, self.pen_rev, self.pen_attrs, self.pen_ul, self.origin) = self.saved_pen;
+    }
+
+    /// Top-left of the addressable area: the scroll region's top in origin mode.
+    fn home(&mut self) {
+        (self.cx, self.cy) = (0, if self.origin { self.top } else { 0 });
+    }
+
+    /// Screen row for 1-based row `n` of CUP / VPA (relative to the scroll region in origin mode).
+    fn row_to(&self, n: usize) -> usize {
+        if self.origin { (self.top + n - 1).min(self.bot - 1) } else { (n - 1).min(self.rows - 1) }
+    }
+
+    /// ANSI modes (no `?`): IRM.
+    fn set_ansi_mode(&mut self, params: &Params, on: bool) {
+        if params.iter().flatten().any(|&p| p == 4) {
+            self.insert = on;
+        }
     }
 
     fn set_mode(&mut self, params: &Params, on: bool) {
@@ -931,6 +1142,22 @@ impl Grid {
                 2004 => self.bracketed_paste = on,
                 1004 => self.focus_events = on,
                 2026 => self.sync_since = on.then(std::time::Instant::now),
+                // DECCOLM (80/132 columns): the window keeps its size, but like a VT100 the
+                // screen is cleared and the margins and cursor reset.
+                3 => {
+                    self.erase(0, self.cols * self.rows);
+                    (self.top, self.bot) = (0, self.rows);
+                    self.home();
+                }
+                6 => {
+                    self.origin = on;
+                    self.home();
+                }
+                5 => {
+                    self.reverse_screen = on;
+                    self.dirty.fill(true);
+                }
+                7 => self.autowrap = on,
                 _ => {}
             }
         }
@@ -978,6 +1205,25 @@ fn percent_decode(s: &[u8]) -> String {
         }
     }
     String::from_utf8_lossy(&out).chars().filter(|c| !c.is_control() && *c != '\u{fffd}').take(200).collect()
+}
+
+/// DEC Special Graphics: the characters 0x60..0x7e as line drawing and symbols.
+fn dec_graphics(ch: char) -> char {
+    const TABLE: &str = "◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·";
+    match ch {
+        '`'..='~' => TABLE.chars().nth(ch as usize - 0x60).unwrap_or(ch),
+        '_' => ' ',
+        _ => ch,
+    }
+}
+
+fn default_tabs(cols: usize) -> Vec<bool> {
+    (0..cols).map(|x| x % 8 == 0).collect()
+}
+
+/// Text a program put in a notification: control characters dropped, at most 200 characters.
+fn notice_text(s: &[u8]) -> String {
+    String::from_utf8_lossy(s).chars().filter(|c| !c.is_control()).take(200).collect()
 }
 
 fn file_uri_path(uri: &[u8]) -> Option<String> {
@@ -1036,6 +1282,7 @@ fn param(params: &Params, i: usize, default: usize) -> usize {
 
 impl Perform for Grid {
     fn print(&mut self, ch: char) {
+        let ch = if self.line_drawing[self.shift_out as usize] { dec_graphics(ch) } else { ch };
         let w = ch.width().unwrap_or(1);
         if w == 0 {
             // Combining mark: attach to the previous cell (or its base if that is a spacer).
@@ -1055,20 +1302,29 @@ impl Perform for Grid {
             return;
         }
         if self.cx + w > self.cols {
-            let last = self.at(self.cy, self.cols - 1);
-            self.cells[last].attrs |= WRAPPED;
-            self.cx = 0;
-            self.newline();
+            if self.autowrap {
+                let last = self.at(self.cy, self.cols - 1);
+                self.cells[last].attrs |= WRAPPED;
+                self.cx = 0;
+                self.newline();
+            } else {
+                self.cx = self.cols.saturating_sub(w);
+            }
         }
         let (fg, bg) = if self.pen_rev { (self.pen_bg, self.pen_fg) } else { (self.pen_fg, self.pen_bg) };
         let i = self.at(self.cy, self.cx);
-        let attrs = self.pen_attrs;
-        self.cells[i] = Cell { ch, comb: ['\0'; 2], fg, bg, attrs };
+        if self.insert {
+            let end = self.at(self.cy, 0) + self.cols;
+            self.cells.copy_within(i..end - w, i + w);
+        }
+        let (attrs, ul) = (self.pen_attrs, self.pen_ul);
+        self.cells[i] = Cell { ch, comb: ['\0'; 2], fg, bg, attrs, ul };
         if w == 2 {
-            self.cells[i + 1] = Cell { ch: '\0', comb: ['\0'; 2], fg, bg, attrs };
+            self.cells[i + 1] = Cell { ch: '\0', comb: ['\0'; 2], fg, bg, attrs, ul };
         }
         self.dirty[self.cy] = true;
         self.cx += w;
+        self.last_char = Some(ch);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -1076,7 +1332,9 @@ impl Perform for Grid {
             b'\n' | 0x0b | 0x0c => self.newline(),
             b'\r' => self.cx = 0,
             0x08 => self.cx = self.cx.min(self.cols - 1).saturating_sub(1),
-            b'\t' => self.cx = ((self.cx / 8 + 1) * 8).min(self.cols - 1),
+            b'\t' => self.tab(1),
+            0x0e => self.shift_out = true,
+            0x0f => self.shift_out = false,
             _ => {}
         }
     }
@@ -1110,11 +1368,31 @@ impl Perform for Grid {
             [b"7", uri, ..] => self.cwd = file_uri_path(uri).or(self.cwd.take()),
             [b"52", _, data, ..] if *data != b"?" => self.clip = Some(base64(data)),
             [b"133", kind, rest @ ..] => self.semantic_prompt(kind, rest),
+            // OSC 777;notify;title;body (urxvt, foot, Ghostty).
+            [b"777", b"notify", title, body @ ..] => self.alert = Some((notice_text(title), notice_text(&body.join(&b';')))),
+            // OSC 9;message (iTerm2). ConEmu's OSC 9;<number>;... (progress and so on) is not a message.
+            [b"9", msg @ ..] if !msg.is_empty() && !(msg.len() > 1 && msg[0].iter().all(u8::is_ascii_digit)) => {
+                let title = if self.tab_title.is_empty() { "litty".into() } else { self.tab_title.clone() };
+                self.alert = Some((title, notice_text(&msg.join(&b';'))));
+            }
             _ => {}
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _: bool, byte: u8) {
+        // DECALN: fill the screen with E (alignment test), margins and cursor reset.
+        if (intermediates, byte) == (b"#", b'8') {
+            self.cells.fill(Cell { ch: 'E', ..Cell::blank(def_fg(), def_bg()) });
+            (self.top, self.bot, self.origin) = (0, self.rows, false);
+            self.home();
+            self.dirty.fill(true);
+            return;
+        }
+        // Designate G0 / G1: '0' is DEC Special Graphics, anything else (B, A, …) text.
+        if let [g @ (b'(' | b')')] = intermediates {
+            self.line_drawing[(*g == b')') as usize] = byte == b'0';
+            return;
+        }
         if !intermediates.is_empty() {
             return;
         }
@@ -1125,8 +1403,11 @@ impl Perform for Grid {
                 self.cx = 0;
                 self.newline();
             }
-            b'7' => self.saved = (self.cx, self.cy),
-            b'8' => (self.cx, self.cy) = self.saved,
+            b'c' => self.full_reset(),
+            b'7' => self.save_cursor(),
+            b'8' => self.restore_cursor(),
+            // HTS: a tab stop at the cursor.
+            b'H' => self.tabs[self.cx.min(self.cols - 1)] = true,
             _ => {}
         }
     }
@@ -1175,16 +1456,19 @@ impl Perform for Grid {
             }
             ([b'?'], 'h') => self.set_mode(params, true),
             ([b'?'], 'l') => self.set_mode(params, false),
-            ([], 'A') => self.cy = self.cy.saturating_sub(n),
-            ([], 'B') => self.cy = (self.cy + n).min(rows - 1),
+            ([], 'h') => self.set_ansi_mode(params, true),
+            ([], 'l') => self.set_ansi_mode(params, false),
+            // CUU / CUD stop at the scroll region's edge when the cursor is inside it.
+            ([], 'A') => self.cy = self.cy.saturating_sub(n).max(if self.cy >= self.top { self.top } else { 0 }),
+            ([], 'B') => self.cy = (self.cy + n).min(if self.cy < self.bot { self.bot } else { rows } - 1),
             ([], 'C') => self.cx = (self.cx + n).min(cols - 1),
             ([], 'D') => self.cx = self.cx.saturating_sub(n),
             ([], 'E') => (self.cx, self.cy) = (0, (self.cy + n).min(rows - 1)),
             ([], 'F') => (self.cx, self.cy) = (0, self.cy.saturating_sub(n)),
             ([], 'G') => self.cx = (n - 1).min(cols - 1),
-            ([], 'd') => self.cy = (n - 1).min(rows - 1),
+            ([], 'd') => self.cy = self.row_to(n),
             ([], 'H' | 'f') => {
-                self.cy = (n - 1).min(rows - 1);
+                self.cy = self.row_to(n);
                 self.cx = (param(params, 1, 1) - 1).min(cols - 1);
             }
             ([], 'J') => {
@@ -1203,6 +1487,7 @@ impl Perform for Grid {
                         if mode == 3 {
                             // Erase saved lines as well.
                             self.history.clear();
+                            self.graphics.clear_lines(false, 0, self.pushed);
                             self.marks.clear();
                             self.scroll = 0;
                         }
@@ -1245,6 +1530,25 @@ impl Perform for Grid {
                 let cur = self.cy * cols + self.cx;
                 self.erase(cur, cur + n.min(cols - self.cx));
             }
+            ([], 'I') => self.tab(n),
+            // CBT: back to the previous tab stop, n times.
+            ([], 'Z') => self.back_tab(n),
+            // TBC: clear the tab stop here (0) or all of them (3).
+            ([], 'g') => match raw(params, 0) {
+                0 => self.tabs[self.cx] = false,
+                3 => self.tabs.fill(false),
+                _ => {}
+            },
+            // DECST8C: back to a stop every 8 columns.
+            ([b'?'], 'W') if raw(params, 0) == 5 => self.tabs = default_tabs(cols),
+            // REP: repeat the last printed character (capped at one screenful).
+            ([], 'b') => {
+                if let Some(ch) = self.last_char {
+                    for _ in 0..n.min(cols * rows) {
+                        self.print(ch);
+                    }
+                }
+            }
             ([], 'S') => self.scroll_up(n),
             ([], 'T') => self.scroll_down(n),
             ([], 'r') => {
@@ -1254,19 +1558,56 @@ impl Perform for Grid {
                 } else {
                     (self.top, self.bot) = (0, rows);
                 }
-                (self.cx, self.cy) = (0, 0);
+                self.home();
             }
             ([], 'm') => self.sgr(params),
-            ([], 's') => self.saved = (self.cx, self.cy),
-            ([], 'u') => (self.cx, self.cy) = self.saved,
+            ([], 's') => self.save_cursor(),
+            ([], 'u') => self.restore_cursor(),
+            // Kitty keyboard protocol: push, pop, set and query the enhancement flags.
+            ([b'>'], 'u') => {
+                let stack = &mut self.kbd[self.in_alt as usize];
+                if stack.len() > 16 {
+                    stack.remove(1);
+                }
+                stack.push(raw(params, 0) as u8 & KBD_FLAGS);
+            }
+            ([b'<'], 'u') => {
+                let stack = &mut self.kbd[self.in_alt as usize];
+                stack.truncate(stack.len().saturating_sub(n).max(1));
+                if stack.len() == 1 {
+                    stack[0] = 0;
+                }
+            }
+            ([b'='], 'u') => {
+                let (flags, top) = (raw(params, 0) as u8 & KBD_FLAGS, self.kbd[self.in_alt as usize].last_mut().expect("base entry"));
+                match raw(params, 1) {
+                    2 => *top |= flags,
+                    3 => *top &= !flags,
+                    _ => *top = flags,
+                }
+            }
+            ([b'?'], 'u') => {
+                let flags = self.kbd_flags();
+                self.reply.extend(format!("\x1b[?{flags}u").as_bytes());
+            }
             // DSR 5: "are you there?" (used as a sentinel after other queries).
             ([], 'n') if raw(params, 0) == 5 => self.reply.extend(b"\x1b[0n"),
-            // Kitty keyboard protocol query: supported, no enhancements active.
-            ([b'?'], 'u') => self.reply.extend(b"\x1b[?0u"),
             ([], 'n') if raw(params, 0) == 6 => {
-                self.reply.extend(format!("\x1b[{};{}R", self.cy + 1, self.cx + 1).bytes());
+                let row = if self.origin { self.cy.saturating_sub(self.top) } else { self.cy };
+                self.reply.extend(format!("\x1b[{};{}R", row + 1, self.cx.min(cols - 1) + 1).bytes());
             }
             ([], 'c') if raw(params, 0) == 0 => self.reply.extend(b"\x1b[?6c"),
+            // XTWINOPS size reports: text area and cell in pixels, and in characters.
+            ([], 't') => {
+                let (cw, ch) = self.cell_px;
+                let reply = match raw(params, 0) {
+                    14 => format!("\x1b[4;{};{}t", rows * ch, cols * cw),
+                    16 => format!("\x1b[6;{ch};{cw}t"),
+                    18 => format!("\x1b[8;{rows};{cols}t"),
+                    _ => String::new(),
+                };
+                self.reply.extend(reply.as_bytes());
+            }
             _ => {}
         }
     }
@@ -1392,7 +1733,108 @@ mod tests {
         let mut g = Grid::new(6, 1);
         feed(&mut g, "\x1b[1ma\x1b[3;4mb\x1b[22;23;24mc\x1b[4:3md\x1b[4:0me");
         let a: Vec<u8> = g.row(0).iter().take(5).map(|c| c.attrs).collect();
-        assert_eq!(a, vec![BOLD, BOLD | ITALIC | UNDERLINE, 0, UNDERLINE, 0]);
+        assert_eq!(a, vec![BOLD, BOLD | ITALIC | UNDERLINE, 0, UNDERLINE | 2 << UL_SHIFT, 0]);
+    }
+
+    #[test]
+    fn underline_styles_and_colour_survive_scrollback() {
+        assert_eq!((std::mem::size_of::<Cell>(), std::mem::size_of::<Run>()), (24, 12), "underline colour must fit in spare bytes");
+        let mut g = Grid::new(8, 1);
+        feed(&mut g, "\x1b[4:2ma\x1b[21mb\x1b[4:5;58:2::255:0:0mc\x1b[58;5;21md\x1b[59me\x1b[24mf\x1b[4;0mg");
+        let row: Vec<Cell> = g.row(0).to_vec();
+        let style = |c: &Cell| (c.attrs & UNDERLINE != 0).then_some((c.attrs & UL_STYLE) >> UL_SHIFT);
+        assert_eq!(row[..7].iter().map(style).collect::<Vec<_>>(), [Some(1), Some(1), Some(4), Some(4), Some(4), None, None]);
+        assert_eq!((row[2].underline_color(7), row[3].underline_color(7), row[4].underline_color(7)), (0xff0000, 0x0000ff, 7));
+        feed(&mut g, "\r\n");
+        let mut buf = Vec::new();
+        let old = g.abs_line(g.pushed - 1, &mut buf).unwrap().to_vec();
+        assert_eq!((old[2].attrs, old[2].underline_color(7)), (row[2].attrs, 0xff0000));
+    }
+
+    #[test]
+    fn rep_and_tab_movement() {
+        let mut g = Grid::new(30, 1);
+        feed(&mut g, "ab\x1b[3b|\x1b[2I|\x1b[Z\x1b[Z#");
+        let text: String = g.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(text.trim_end(), "abbbb|  #       |");
+    }
+
+    #[test]
+    fn kitty_keyboard_flags_stack_per_screen() {
+        let mut g = Grid::new(10, 2);
+        feed(&mut g, "\x1b[>1u\x1b[>11u\x1b[?u");
+        assert_eq!((g.kbd_flags(), std::mem::take(&mut g.reply)), (11, b"\x1b[?11u".to_vec()));
+        feed(&mut g, "\x1b[?1049h");
+        assert_eq!(g.kbd_flags(), 0, "the alternate screen has its own stack");
+        feed(&mut g, "\x1b[=5u\x1b[=2;2u\x1b[=4;3u");
+        assert_eq!(g.kbd_flags(), 3);
+        feed(&mut g, "\x1b[?1049l\x1b[<u");
+        assert_eq!(g.kbd_flags(), 1);
+        feed(&mut g, "\x1b[<9u\x1b[>255u");
+        assert_eq!(g.kbd_flags(), 31, "unknown flags are dropped, popping stops at the base");
+    }
+
+    #[test]
+    fn vt_modes_insert_autowrap_origin_and_alignment() {
+        let mut g = Grid::new(6, 4);
+        feed(&mut g, "abcd\r\x1b[4hXY\x1b[4l");
+        assert_eq!(g.row(0).iter().map(|c| c.ch).collect::<String>(), "XYabcd");
+        feed(&mut g, "\x1b[2;1H\x1b[?7l123456789\x1b[?7h");
+        assert_eq!(g.row(1).iter().map(|c| c.ch).collect::<String>(), "123459");
+        feed(&mut g, "\x1b[2;3r\x1b[?6h\x1b[1;1Ho\x1b[9;1Hp\x1b[6n\x1b[?6l\x1b[r");
+        assert_eq!((g.row(1)[0].ch, g.row(2)[0].ch, std::mem::take(&mut g.reply)), ('o', 'p', b"\x1b[2;2R".to_vec()));
+        feed(&mut g, "\x1b[31m\x1b7\x1b[0m\x1b8x");
+        assert_eq!((g.row(0)[0].ch, g.row(0)[0].fg), ('x', ansi()[1]), "DECRC restores the pen");
+        feed(&mut g, "\x1b[2;3r\x1b[3;1H\x1b[9Bq\x1b[9Ar\x1b[r");
+        assert_eq!((g.row(2)[0].ch, g.row(1)[1].ch), ('q', 'r'), "CUD/CUU stop at the margins");
+        feed(&mut g, "\x1b#8");
+        assert!(g.row(3).iter().all(|c| c.ch == 'E') && (g.cx, g.cy) == (0, 0));
+    }
+
+    #[test]
+    fn size_reports_in_pixels() {
+        let mut g = Grid::new(80, 24);
+        g.cell_px = (9, 18);
+        feed(&mut g, "\x1b[14t\x1b[16t\x1b[18t");
+        assert_eq!(g.reply, b"\x1b[4;432;720t\x1b[6;18;9t\x1b[8;24;80t");
+    }
+
+    #[test]
+    fn full_reset() {
+        let mut g = Grid::new(10, 3);
+        feed(&mut g, "\x1b[?7l\x1b[4h\x1b(0\x1b[2;3r\x1b[31m\x1b[?2004h\x1b[>1uq\x1bcq");
+        assert_eq!((g.row(0)[0].ch, g.row(0)[0].fg), ('q', def_fg()));
+        assert!(g.autowrap && !g.insert && !g.bracketed_paste && g.kbd_flags() == 0 && (g.top, g.bot) == (0, 3));
+    }
+
+    #[test]
+    fn dec_line_drawing() {
+        let mut g = Grid::new(12, 2);
+        feed(&mut g, "\x1b(0lqk\x1b(Bq\x1b)0\x0ex\x0fx\x1b(0\x1b7\x1b(B\x1b8q");
+        assert_eq!(g.row(0).iter().map(|c| c.ch).collect::<String>().trim_end(), "┌─┐q│x─", "DECRC restores the character set");
+    }
+
+    #[test]
+    fn programs_set_and_clear_tab_stops() {
+        let mut g = Grid::new(30, 1);
+        feed(&mut g, "\x1b[3g\x1b[5G\x1bH\x1b[12G\x1bH\r\ta\tb\tc");
+        let text: String = g.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(text.trim_end(), "    a      b                 c");
+        feed(&mut g, "\x1b[Z\x1b[Z\x1b[Z#\x1b[?5W\r\t\x1b[g\r\t@");
+        let text: String = g.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(text.trim_end(), "#   a      b    @            c");
+    }
+
+    #[test]
+    fn programs_can_ask_for_notifications() {
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "\x1b]777;notify;Build;done; all green\x07");
+        assert_eq!(g.alert.take(), Some(("Build".into(), "done; all green".into())));
+        feed(&mut g, "\x1b]2;vim\x07\x1b]9;tests passed\x07");
+        assert_eq!(g.alert.take(), Some(("vim".into(), "tests passed".into())));
+        // ConEmu progress reports are not messages.
+        feed(&mut g, "\x1b]9;4;1;50\x07");
+        assert_eq!(g.alert, None);
     }
 
     #[test]

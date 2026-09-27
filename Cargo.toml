@@ -1,6 +1,6 @@
 [package]
 name = "litty-term"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "litty: a tiny, fast, zero-config terminal emulator for macOS and Linux"
 license = "MIT"
@@ -8,7 +8,7 @@ repository = "https://github.com/stawan15/litty"
 readme = "README.md"
 keywords = ["terminal", "terminal-emulator", "tty", "pty"]
 categories = ["command-line-utilities"]
-include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+include = ["src/**", "assets/thai-words.bin", "assets/SymbolsNerdFont*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [[bin]]
 name = "litty"
@@ -25,11 +25,12 @@ maintainer = "stawan15"
 section = "utils"
 extended-description = "Zero config: tabs and splits, scrollback with reflow, ligatures, command blocks and Thai support."
 priority = "optional"
-depends = "$auto"
+depends = "$auto, curl"
 assets = [
     ["target/release/litty", "usr/bin/", "755"],
     ["packaging/litty.desktop", "usr/share/applications/", "644"],
     ["packaging/litty.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["target/terminfo/x/xterm-litty", "usr/share/terminfo/x/", "644"],
     ["README.md", "usr/share/doc/litty/", "644"],
 ]
 
@@ -39,6 +40,7 @@ assets = [
     { source = "target/release/litty", dest = "/usr/bin/litty", mode = "755" },
     { source = "packaging/litty.desktop", dest = "/usr/share/applications/litty.desktop", mode = "644" },
     { source = "packaging/litty.png", dest = "/usr/share/icons/hicolor/512x512/apps/litty.png", mode = "644" },
+    { source = "target/terminfo/x/xterm-litty", dest = "/usr/share/terminfo/x/xterm-litty", mode = "644" },
 ]
 
 [dependencies]
@@ -48,6 +50,7 @@ nix = { version = "0.31.3", features = ["term", "process", "ioctl"] }
 rustybuzz = "0.20.1"
 ttf-parser = "0.25"
 png = "0.17"
+miniz_oxide = "0.8"
 unicode-width = "0.2.2"
 vte = "0.15.0"
 winit = "0.30.13"
