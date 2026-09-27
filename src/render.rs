@@ -91,16 +91,19 @@ fn blend_glyph(fb: &mut [u32], w: usize, clip: [usize; 4], g: &Glyph, ox: usize,
 
 /// Blend a straight-alpha RGBA bitmap into the framebuffer at (ox, oy), inside `clip`.
 fn blend_rgba(fb: &mut [u32], w: usize, clip: [usize; 4], bmp: &crate::emoji::Bitmap, ox: usize, oy: usize) {
+    blend_image(fb, w, clip, &bmp.rgba, (bmp.side, bmp.side), ox, oy);
+}
+
+/// Blend straight-alpha RGBA pixels (`size` = width, height) at (ox, oy), only inside `clip`.
+fn blend_image(fb: &mut [u32], w: usize, clip: [usize; 4], rgba: &[u8], size: (usize, usize), ox: usize, oy: usize) {
     let [cx0, cy0, cx1, cy1] = clip;
-    for row in 0..bmp.side {
+    let (iw, ih) = size;
+    for row in cy0.saturating_sub(oy)..ih.min(cy1.saturating_sub(oy)) {
         let py = oy + row;
-        if py < cy0 || py >= cy1 {
-            continue;
-        }
-        for col in 0..bmp.side {
+        for col in cx0.saturating_sub(ox)..iw.min(cx1.saturating_sub(ox)) {
             let px = ox + col;
-            let p = &bmp.rgba[(row * bmp.side + col) * 4..][..4];
-            if p[3] == 0 || px < cx0 || px >= cx1 {
+            let p = &rgba[(row * iw + col) * 4..][..4];
+            if p[3] == 0 {
                 continue;
             }
             let (a, dst) = (p[3] as u32, &mut fb[py * w + px]);
@@ -274,10 +277,18 @@ impl Renderer {
             g.dirty[g.drawn_cursor_row] = true;
         }
         g.dirty[g.cy] = true;
+        let images = !g.graphics.placements.is_empty();
+        let mut drawn = vec![false; if images { g.rows } else { 0 }];
         for y in 0..g.rows {
             if std::mem::take(&mut g.dirty[y]) {
                 self.draw_row(g, y, view);
+                if images {
+                    drawn[y] = true;
+                }
             }
+        }
+        if images {
+            self.draw_images(g, view.rect, &drawn);
         }
         g.drawn_cursor_row = g.cy;
         if let Some(q) = view.find {
@@ -285,6 +296,42 @@ impl Renderer {
         }
         if let Some(n) = view.notice {
             self.draw_notice(n, view.rect);
+        }
+    }
+
+    /// Images (Kitty graphics) over the rows just drawn, each at the cell it is anchored to.
+    fn draw_images(&mut self, g: &mut Grid, rect: Rect, drawn: &[bool]) {
+        let (cw, ch) = (self.fonts.cell_w, self.fonts.cell_h);
+        let view_top = g.abs_row(0);
+        let (alt, rows, cols) = (g.in_alt, g.rows, g.cols);
+        let crate::graphics::Graphics { images, placements, .. } = &mut g.graphics;
+        for p in placements.iter_mut().filter(|p| p.alt == alt) {
+            let Some(img) = images.get(&p.image) else { continue };
+            // Scale once to the size it is shown at (natural size needs no copy).
+            if p.px != (img.w, img.h) && p.scaled.is_none() {
+                p.scaled = Some(crate::graphics::scale(&img.rgba, img.w, img.h, p.px.0, p.px.1));
+            }
+            let pixels = p.scaled.as_deref().unwrap_or(&img.rgba);
+            let (ox, top) = (rect.x + p.col * cw, p.line as i64 - view_top as i64);
+            for r in 0..p.rows as i64 {
+                let vy = top + r;
+                if vy < 0 || vy >= rows as i64 || !drawn[vy as usize] {
+                    continue;
+                }
+                let band_y = rect.y + vy as usize * ch;
+                let clip = [rect.x, band_y, (rect.x + cols * cw).min(self.w), (band_y + ch).min(self.h)];
+                // The image's top may be above the pane (scrolled): offset within the band.
+                let oy = band_y as i64 - r * ch as i64;
+                if oy >= 0 {
+                    blend_image(&mut self.fb, self.w, clip, pixels, p.px, ox, oy as usize);
+                } else {
+                    let skip = (-oy) as usize;
+                    if skip < p.px.1 {
+                        blend_image(&mut self.fb, self.w, clip, &pixels[skip * p.px.0 * 4..], (p.px.0, p.px.1 - skip), ox, 0);
+                    }
+                }
+                self.mark(band_y, band_y + ch);
+            }
         }
     }
 

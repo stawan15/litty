@@ -2,6 +2,7 @@ mod boxdraw;
 mod config;
 mod emoji;
 mod font;
+mod graphics;
 mod grid;
 mod kitty;
 #[cfg(target_os = "macos")]
@@ -62,6 +63,8 @@ struct Term {
     parser: Parser,
     /// Cmd+Shift+R: this pane's output is being saved as an asciinema cast.
     recorder: Option<record::Recorder>,
+    /// Takes image commands (APC) out of the output before the VT parser, which drops them.
+    apc: graphics::ApcSplit,
 }
 
 enum Ev {
@@ -538,8 +541,11 @@ fn spawn_reader(id: usize, mut pty: File, term: Arc<Mutex<Term>>, pending: Arc<A
             debug_log("out", &buf[..n]);
             let reply = {
                 let mut t = term.lock().unwrap();
-                let Term { grid, parser, recorder } = &mut *t;
-                parser.advance(grid, &buf[..n]);
+                let Term { grid, parser, recorder, apc } = &mut *t;
+                apc.split(&buf[..n], |piece| match piece {
+                    graphics::Piece::Text(text) => parser.advance(grid, text),
+                    graphics::Piece::Apc(payload) => grid.apc(payload),
+                });
                 if let Some(r) = recorder {
                     r.output(&buf[..n]);
                 }
@@ -875,8 +881,10 @@ impl Win {
                     r.resize(cols, rows);
                 }
                 grid.resize(cols, rows);
+                grid.cell_px = cell;
                 drop(t);
-                let ws = Winsize { ws_row: rows as u16, ws_col: cols as u16, ws_xpixel: rect.w as u16, ws_ypixel: rect.h as u16 };
+                // Pixel size of the text area (programs divide it by rows/columns to size images).
+                let ws = Winsize { ws_row: rows as u16, ws_col: cols as u16, ws_xpixel: (cols * cell.0) as u16, ws_ypixel: (rows * cell.1) as u16 };
                 let _ = unsafe { tiocswinsz(pane.master.as_raw_fd(), &ws) };
             }
             for pane in &tab.panes {
@@ -974,7 +982,9 @@ impl Win {
             eprintln!("litty: failed to start a shell");
             return None;
         };
-        let term = Arc::new(Mutex::new(Term { grid: Grid::new(cols, rows), parser: Parser::new(), recorder: None }));
+        let mut grid = Grid::new(cols, rows);
+        grid.cell_px = self.renderer.as_ref().map_or((10, 20), |r| (r.fonts.cell_w, r.fonts.cell_h));
+        let term = Arc::new(Mutex::new(Term { grid, parser: Parser::new(), recorder: None, apc: Default::default() }));
         let (pending, exited) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let id = NEXT_PANE.fetch_add(1, Ordering::Relaxed);
         spawn_reader(id, master.try_clone().ok()?, term.clone(), pending.clone(), exited.clone(), pid, self.proxy.clone());

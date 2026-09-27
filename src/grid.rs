@@ -243,6 +243,10 @@ pub struct Grid {
     pub cur_match: usize,
     /// Set when a long command finishes; taken by the app.
     pub finished: Option<Finished>,
+    /// Images (Kitty graphics protocol) and where they are shown.
+    pub graphics: crate::graphics::Graphics,
+    /// Cell size in pixels, for placing images at their natural size (set by the window).
+    pub cell_px: (usize, usize),
     /// A notification a program asked for (OSC 9 or OSC 777): (title, body); taken by the app.
     pub alert: Option<(String, String)>,
     pen_fg: u32,
@@ -323,6 +327,8 @@ impl Grid {
             cur_match: 0,
             finished: None,
             alert: None,
+            graphics: Default::default(),
+            cell_px: (10, 20),
             pen_fg: def_fg(),
             pen_bg: def_bg(),
             pen_rev: false,
@@ -469,12 +475,16 @@ impl Grid {
             m.out = m.out.map(remap);
             m.end = m.end.map(remap);
         }
+        for p in self.graphics.placements.iter_mut().filter(|p| !p.alt) {
+            p.line = remap(p.line);
+        }
 
         // Keep the cursor on screen: rows above overflow into scrollback.
         let drop = total.saturating_sub(rows).min(cursor.0);
         for row in &out[..drop] {
             Self::push_line(&mut self.history, &mut self.pushed, &mut self.marks, &mut self.scroll, row);
         }
+        self.forget_old_images();
         let mut cells = Vec::with_capacity(cols * rows);
         for r in drop..drop + rows {
             match out.get(r) {
@@ -514,6 +524,37 @@ impl Grid {
         let i = self.at(r, 0);
         let row = &self.cells[i..i + self.cols];
         Self::push_line(&mut self.history, &mut self.pushed, &mut self.marks, &mut self.scroll, row);
+        self.forget_old_images();
+    }
+
+    /// Images on lines that have left scrollback go with them.
+    fn forget_old_images(&mut self) {
+        if !self.graphics.placements.is_empty() {
+            self.graphics.forget_before(self.pushed - self.history.len() as u64);
+        }
+    }
+
+    /// A Kitty graphics command (APC `G…`): store the image, show it at the cursor, reply.
+    pub fn apc(&mut self, payload: &[u8]) {
+        let Some(out) = self.graphics.command(payload) else { return };
+        if let Some(reply) = out.reply {
+            self.reply.extend(reply.as_bytes());
+        }
+        let Some((image, keys)) = out.place else { return };
+        self.cx = self.cx.min(self.cols - 1);
+        let line = self.pushed + self.cy as u64;
+        let (cols, rows) = self.graphics.place(image, &keys, line, self.cx, self.cell_px, self.in_alt);
+        let first = self.cy;
+        if !keys.no_move {
+            // Like kitty: the cursor ends after the image's last column, on its last row.
+            for _ in 1..rows {
+                self.newline();
+            }
+            self.cx = (self.cx + cols).min(self.cols);
+        }
+        for y in first.saturating_sub(rows)..self.rows {
+            self.dirty[y] = true;
+        }
     }
 
     /// Append `row` to scrollback (associated fn so callers can borrow `cells` at the same time).
@@ -803,6 +844,7 @@ impl Grid {
     /// blocks that pointed at them must go (keeps `marks` sorted and unambiguous).
     fn forget_screen_marks(&mut self) {
         let live = self.pushed;
+        self.graphics.clear_lines(self.in_alt, live, live + self.rows as u64);
         self.marks.retain(|m| m.start < live);
         for m in &mut self.marks {
             if m.end.is_some_and(|e| e > live) {
@@ -929,6 +971,7 @@ impl Grid {
         }
         self.in_alt = on;
         self.scroll = 0;
+        self.graphics.clear_lines(true, 0, u64::MAX);
         std::mem::swap(&mut self.cells, &mut self.alt_cells);
         std::mem::swap(&mut self.off, &mut self.alt_off);
         if on {
@@ -1039,6 +1082,7 @@ impl Grid {
     /// and the window title are kept.
     fn full_reset(&mut self) {
         self.set_alt(false);
+        self.graphics.placements.clear();
         self.reset_pen();
         self.erase(0, self.cols * self.rows);
         (self.top, self.bot) = (0, self.rows);
@@ -1443,6 +1487,7 @@ impl Perform for Grid {
                         if mode == 3 {
                             // Erase saved lines as well.
                             self.history.clear();
+                            self.graphics.clear_lines(false, 0, self.pushed);
                             self.marks.clear();
                             self.scroll = 0;
                         }
@@ -1552,6 +1597,17 @@ impl Perform for Grid {
                 self.reply.extend(format!("\x1b[{};{}R", row + 1, self.cx.min(cols - 1) + 1).bytes());
             }
             ([], 'c') if raw(params, 0) == 0 => self.reply.extend(b"\x1b[?6c"),
+            // XTWINOPS size reports: text area and cell in pixels, and in characters.
+            ([], 't') => {
+                let (cw, ch) = self.cell_px;
+                let reply = match raw(params, 0) {
+                    14 => format!("\x1b[4;{};{}t", rows * ch, cols * cw),
+                    16 => format!("\x1b[6;{ch};{cw}t"),
+                    18 => format!("\x1b[8;{rows};{cols}t"),
+                    _ => String::new(),
+                };
+                self.reply.extend(reply.as_bytes());
+            }
             _ => {}
         }
     }
@@ -1733,6 +1789,14 @@ mod tests {
         assert_eq!((g.row(2)[0].ch, g.row(1)[1].ch), ('q', 'r'), "CUD/CUU stop at the margins");
         feed(&mut g, "\x1b#8");
         assert!(g.row(3).iter().all(|c| c.ch == 'E') && (g.cx, g.cy) == (0, 0));
+    }
+
+    #[test]
+    fn size_reports_in_pixels() {
+        let mut g = Grid::new(80, 24);
+        g.cell_px = (9, 18);
+        feed(&mut g, "\x1b[14t\x1b[16t\x1b[18t");
+        assert_eq!(g.reply, b"\x1b[4;432;720t\x1b[6;18;9t\x1b[8;24;80t");
     }
 
     #[test]

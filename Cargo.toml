@@ -50,6 +50,7 @@ nix = { version = "0.31.3", features = ["term", "process", "ioctl"] }
 rustybuzz = "0.20.1"
 ttf-parser = "0.25"
 png = "0.17"
+miniz_oxide = "0.8"
 unicode-width = "0.2.2"
 vte = "0.15.0"
 winit = "0.30.13"
