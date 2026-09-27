@@ -20,7 +20,9 @@ mkdir dist/dmg && cp -R dist/litty.app dist/dmg/ && ln -s /Applications dist/dmg
 hdiutil create -quiet -volname "litty" -srcfolder dist/dmg -ov -format UDZO "dist/litty-$VERSION-macos-universal.dmg"
 for t in aarch64-apple-darwin x86_64-apple-darwin; do
   d="litty-$VERSION-$t"
-  mkdir "dist/$d" && cp dist/litty.app/Contents/MacOS/litty README.md LICENSE "dist/$d/"
+  # One architecture per tarball (the universal binary is only for the app).
+  mkdir "dist/$d" && cp "target/$t/release/litty" README.md LICENSE "dist/$d/"
+  codesign --force -s - "dist/$d/litty"
   tar -C dist -czf "dist/$d.tar.gz" "$d"
   rm -rf "dist/$d"
 done
