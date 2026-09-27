@@ -9,6 +9,11 @@ pub const UNDERLINE: u8 = 4;
 /// Set on the last cell of a row whose text continues on the next row (soft wrap), so resizing
 /// can re-join and re-wrap lines.
 pub const WRAPPED: u8 = 8;
+/// Underline style (SGR 4:n) when UNDERLINE is set: 0 single, 1 double, 2 curly, 3 dotted, 4 dashed.
+pub const UL_STYLE: u8 = 0x70;
+pub const UL_SHIFT: u8 = 4;
+/// The cell's `ul` holds an underline colour (SGR 58); otherwise the underline takes the text colour.
+pub const UL_COLOR: u8 = 0x80;
 
 const HISTORY_CAP: usize = 20_000;
 
@@ -47,13 +52,27 @@ pub struct Finished {
 /// Commands slower than this ask for attention if the window is in the background.
 const LONG_COMMAND: Duration = Duration::from_secs(8);
 
-/// `n` consecutive cells sharing one style.
-#[derive(Clone, Copy)]
+/// `n` consecutive cells sharing one style. Colours use 24 bits, so the underline colour's red and
+/// green ride in the top bytes of `fg` and `bg` and blue in `ul_b`: a Run stays 12 bytes.
+#[derive(Clone, Copy, PartialEq)]
 struct Run {
     n: u16,
     fg: u32,
     bg: u32,
     attrs: u8,
+    ul_b: u8,
+}
+
+impl Run {
+    fn of(c: &Cell) -> Run {
+        let [r, g, b] = c.ul;
+        Run { n: 1, fg: c.fg | (r as u32) << 24, bg: c.bg | (g as u32) << 24, attrs: c.attrs, ul_b: b }
+    }
+
+    /// (fg, bg, attrs, ul) as stored in a Cell.
+    fn style(&self) -> (u32, u32, u8, [u8; 3]) {
+        (self.fg & 0xffffff, self.bg & 0xffffff, self.attrs, [(self.fg >> 24) as u8, (self.bg >> 24) as u8, self.ul_b])
+    }
 }
 
 /// A scrolled-off line stored as text plus style runs: ~10x smaller than a `Vec<Cell>`.
@@ -72,15 +91,16 @@ impl HLine {
                 self.text.push(c.ch);
                 self.text.extend(c.comb.iter().filter(|&&m| m != '\0'));
             }
+            let run = Run::of(c);
             match self.runs.last_mut() {
-                Some(r) if (r.fg, r.bg, r.attrs) == (c.fg, c.bg, c.attrs) => r.n += 1,
-                _ => self.runs.push(Run { n: 1, fg: c.fg, bg: c.bg, attrs: c.attrs }),
+                Some(r) if Run { n: r.n, ..run } == *r => r.n += 1,
+                _ => self.runs.push(run),
             }
         }
     }
 
     fn decode(&self, out: &mut Vec<Cell>) {
-        let mut styles = self.runs.iter().flat_map(|r| std::iter::repeat_n((r.fg, r.bg, r.attrs), r.n as usize));
+        let mut styles = self.runs.iter().flat_map(|r| std::iter::repeat_n(r.style(), r.n as usize));
         let mut base = None;
         for ch in self.text.chars() {
             if ch.width() == Some(0) {
@@ -92,12 +112,12 @@ impl HLine {
                 }
                 continue;
             }
-            let (fg, bg, attrs) = styles.next().unwrap_or((def_fg(), def_bg(), 0));
+            let (fg, bg, attrs, ul) = styles.next().unwrap_or((def_fg(), def_bg(), 0, [0; 3]));
             base = Some(out.len());
-            out.push(Cell { ch, comb: ['\0'; 2], fg, bg, attrs });
+            out.push(Cell { ch, comb: ['\0'; 2], fg, bg, attrs, ul });
             if ch.width() == Some(2) {
-                let (fg, bg, attrs) = styles.next().unwrap_or((def_fg(), def_bg(), 0));
-                out.push(Cell { ch: '\0', comb: ['\0'; 2], fg, bg, attrs });
+                let (fg, bg, attrs, ul) = styles.next().unwrap_or((def_fg(), def_bg(), 0, [0; 3]));
+                out.push(Cell { ch: '\0', comb: ['\0'; 2], fg, bg, attrs, ul });
             }
         }
     }
@@ -154,11 +174,18 @@ pub struct Cell {
     pub fg: u32,
     pub bg: u32,
     pub attrs: u8,
+    /// Underline colour as RGB bytes when `attrs` has UL_COLOR (fits in padding: a Cell stays 24 bytes).
+    pub ul: [u8; 3],
 }
 
 impl Cell {
     fn blank(fg: u32, bg: u32) -> Self {
-        Cell { ch: ' ', comb: ['\0'; 2], fg, bg, attrs: 0 }
+        Cell { ch: ' ', comb: ['\0'; 2], fg, bg, attrs: 0, ul: [0; 3] }
+    }
+
+    /// The underline colour: SGR 58 if set, else `fg` (the drawn text colour).
+    pub fn underline_color(&self, fg: u32) -> u32 {
+        if self.attrs & UL_COLOR == 0 { fg } else { u32::from_be_bytes([0, self.ul[0], self.ul[1], self.ul[2]]) }
     }
 }
 
@@ -210,10 +237,15 @@ pub struct Grid {
     pub cur_match: usize,
     /// Set when a long command finishes; taken by the app.
     pub finished: Option<Finished>,
+    /// A notification a program asked for (OSC 9 or OSC 777): (title, body); taken by the app.
+    pub alert: Option<(String, String)>,
     pen_fg: u32,
     pen_bg: u32,
     pen_rev: bool,
     pen_attrs: u8,
+    pen_ul: [u8; 3],
+    /// The last printed character, for REP (CSI b).
+    last_char: Option<char>,
     top: usize,
     bot: usize,
     saved: (usize, usize),
@@ -268,10 +300,13 @@ impl Grid {
             matches: Vec::new(),
             cur_match: 0,
             finished: None,
+            alert: None,
             pen_fg: def_fg(),
             pen_bg: def_bg(),
             pen_rev: false,
             pen_attrs: 0,
+            pen_ul: [0; 3],
+            last_char: None,
             top: 0,
             bot: rows,
             saved: (0, 0),
@@ -876,13 +911,12 @@ impl Grid {
             if s.len() > 1 {
                 // Colon-separated sub-parameters: 38:2::r:g:b, 48:5:n, 4:3.
                 match s[0] {
-                    38 | 48 => {
+                    38 | 48 | 58 => {
                         if let Some(col) = colon_color(s) {
-                            if s[0] == 38 { self.pen_fg = col } else { self.pen_bg = col }
+                            self.set_color(s[0], col);
                         }
                     }
-                    4 if s[1] == 0 => self.pen_attrs &= !UNDERLINE,
-                    4 => self.pen_attrs |= UNDERLINE,
+                    4 => self.set_underline(s[1]),
                     _ => {}
                 }
                 continue;
@@ -892,11 +926,12 @@ impl Grid {
                 0 => self.reset_pen(),
                 1 => self.pen_attrs |= BOLD,
                 3 => self.pen_attrs |= ITALIC,
-                4 => self.pen_attrs |= UNDERLINE,
+                4 => self.set_underline(1),
                 7 => self.pen_rev = true,
+                21 => self.set_underline(2),
                 22 => self.pen_attrs &= !BOLD,
                 23 => self.pen_attrs &= !ITALIC,
-                24 => self.pen_attrs &= !UNDERLINE,
+                24 => self.set_underline(0),
                 27 => self.pen_rev = false,
                 30..=37 => self.pen_fg = ansi()[(c - 30) as usize],
                 39 => self.pen_fg = def_fg(),
@@ -904,14 +939,42 @@ impl Grid {
                 49 => self.pen_bg = def_bg(),
                 90..=97 => self.pen_fg = ansi()[(c - 90) as usize + 8],
                 100..=107 => self.pen_bg = ansi()[(c - 100) as usize + 8],
-                38 | 48 => {
+                38 | 48 | 58 => {
                     if let Some(col) = extended_color(&mut it.by_ref().map(|s| s[0])) {
-                        if c == 38 { self.pen_fg = col } else { self.pen_bg = col }
+                        self.set_color(c, col);
                     }
                 }
+                59 => self.pen_attrs &= !UL_COLOR,
                 _ => {}
             }
         }
+    }
+
+    /// SGR 38 / 48 / 58: text, background or underline colour.
+    fn set_color(&mut self, which: u16, col: u32) {
+        match which {
+            38 => self.pen_fg = col,
+            48 => self.pen_bg = col,
+            _ => {
+                let [_, r, g, b] = col.to_be_bytes();
+                self.pen_ul = [r, g, b];
+                self.pen_attrs |= UL_COLOR;
+            }
+        }
+    }
+
+    /// SGR 4:n: 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed (unknown styles: single).
+    fn set_underline(&mut self, n: u16) {
+        self.pen_attrs &= !(UNDERLINE | UL_STYLE);
+        if n > 0 {
+            let style = if n <= 5 { n as u8 - 1 } else { 0 };
+            self.pen_attrs |= UNDERLINE | style << UL_SHIFT;
+        }
+    }
+
+    /// Forward to the n-th next tab stop (every 8 columns), stopping at the last column.
+    fn tab(&mut self, n: usize) {
+        self.cx = ((self.cx / 8 + n) * 8).min(self.cols - 1);
     }
 
     fn reset_pen(&mut self) {
@@ -978,6 +1041,11 @@ fn percent_decode(s: &[u8]) -> String {
         }
     }
     String::from_utf8_lossy(&out).chars().filter(|c| !c.is_control() && *c != '\u{fffd}').take(200).collect()
+}
+
+/// Text a program put in a notification: control characters dropped, at most 200 characters.
+fn notice_text(s: &[u8]) -> String {
+    String::from_utf8_lossy(s).chars().filter(|c| !c.is_control()).take(200).collect()
 }
 
 fn file_uri_path(uri: &[u8]) -> Option<String> {
@@ -1062,13 +1130,14 @@ impl Perform for Grid {
         }
         let (fg, bg) = if self.pen_rev { (self.pen_bg, self.pen_fg) } else { (self.pen_fg, self.pen_bg) };
         let i = self.at(self.cy, self.cx);
-        let attrs = self.pen_attrs;
-        self.cells[i] = Cell { ch, comb: ['\0'; 2], fg, bg, attrs };
+        let (attrs, ul) = (self.pen_attrs, self.pen_ul);
+        self.cells[i] = Cell { ch, comb: ['\0'; 2], fg, bg, attrs, ul };
         if w == 2 {
-            self.cells[i + 1] = Cell { ch: '\0', comb: ['\0'; 2], fg, bg, attrs };
+            self.cells[i + 1] = Cell { ch: '\0', comb: ['\0'; 2], fg, bg, attrs, ul };
         }
         self.dirty[self.cy] = true;
         self.cx += w;
+        self.last_char = Some(ch);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -1076,7 +1145,7 @@ impl Perform for Grid {
             b'\n' | 0x0b | 0x0c => self.newline(),
             b'\r' => self.cx = 0,
             0x08 => self.cx = self.cx.min(self.cols - 1).saturating_sub(1),
-            b'\t' => self.cx = ((self.cx / 8 + 1) * 8).min(self.cols - 1),
+            b'\t' => self.tab(1),
             _ => {}
         }
     }
@@ -1110,6 +1179,13 @@ impl Perform for Grid {
             [b"7", uri, ..] => self.cwd = file_uri_path(uri).or(self.cwd.take()),
             [b"52", _, data, ..] if *data != b"?" => self.clip = Some(base64(data)),
             [b"133", kind, rest @ ..] => self.semantic_prompt(kind, rest),
+            // OSC 777;notify;title;body (urxvt, foot, Ghostty).
+            [b"777", b"notify", title, body @ ..] => self.alert = Some((notice_text(title), notice_text(&body.join(&b';')))),
+            // OSC 9;message (iTerm2). ConEmu's OSC 9;<number>;... (progress and so on) is not a message.
+            [b"9", msg @ ..] if !msg.is_empty() && !(msg.len() > 1 && msg[0].iter().all(u8::is_ascii_digit)) => {
+                let title = if self.tab_title.is_empty() { "litty".into() } else { self.tab_title.clone() };
+                self.alert = Some((title, notice_text(&msg.join(&b';'))));
+            }
             _ => {}
         }
     }
@@ -1244,6 +1320,17 @@ impl Perform for Grid {
             ([], 'X') => {
                 let cur = self.cy * cols + self.cx;
                 self.erase(cur, cur + n.min(cols - self.cx));
+            }
+            ([], 'I') => self.tab(n),
+            // CBT: back to the previous tab stop, n times.
+            ([], 'Z') => self.cx = self.cx.div_ceil(8).saturating_sub(n) * 8,
+            // REP: repeat the last printed character (capped at one screenful).
+            ([], 'b') => {
+                if let Some(ch) = self.last_char {
+                    for _ in 0..n.min(cols * rows) {
+                        self.print(ch);
+                    }
+                }
             }
             ([], 'S') => self.scroll_up(n),
             ([], 'T') => self.scroll_down(n),
@@ -1392,7 +1479,42 @@ mod tests {
         let mut g = Grid::new(6, 1);
         feed(&mut g, "\x1b[1ma\x1b[3;4mb\x1b[22;23;24mc\x1b[4:3md\x1b[4:0me");
         let a: Vec<u8> = g.row(0).iter().take(5).map(|c| c.attrs).collect();
-        assert_eq!(a, vec![BOLD, BOLD | ITALIC | UNDERLINE, 0, UNDERLINE, 0]);
+        assert_eq!(a, vec![BOLD, BOLD | ITALIC | UNDERLINE, 0, UNDERLINE | 2 << UL_SHIFT, 0]);
+    }
+
+    #[test]
+    fn underline_styles_and_colour_survive_scrollback() {
+        assert_eq!((std::mem::size_of::<Cell>(), std::mem::size_of::<Run>()), (24, 12), "underline colour must fit in spare bytes");
+        let mut g = Grid::new(8, 1);
+        feed(&mut g, "\x1b[4:2ma\x1b[21mb\x1b[4:5;58:2::255:0:0mc\x1b[58;5;21md\x1b[59me\x1b[24mf\x1b[4;0mg");
+        let row: Vec<Cell> = g.row(0).to_vec();
+        let style = |c: &Cell| (c.attrs & UNDERLINE != 0).then_some((c.attrs & UL_STYLE) >> UL_SHIFT);
+        assert_eq!(row[..7].iter().map(style).collect::<Vec<_>>(), [Some(1), Some(1), Some(4), Some(4), Some(4), None, None]);
+        assert_eq!((row[2].underline_color(7), row[3].underline_color(7), row[4].underline_color(7)), (0xff0000, 0x0000ff, 7));
+        feed(&mut g, "\r\n");
+        let mut buf = Vec::new();
+        let old = g.abs_line(g.pushed - 1, &mut buf).unwrap().to_vec();
+        assert_eq!((old[2].attrs, old[2].underline_color(7)), (row[2].attrs, 0xff0000));
+    }
+
+    #[test]
+    fn rep_and_tab_movement() {
+        let mut g = Grid::new(30, 1);
+        feed(&mut g, "ab\x1b[3b|\x1b[2I|\x1b[Z\x1b[Z#");
+        let text: String = g.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(text.trim_end(), "abbbb|  #       |");
+    }
+
+    #[test]
+    fn programs_can_ask_for_notifications() {
+        let mut g = Grid::new(10, 1);
+        feed(&mut g, "\x1b]777;notify;Build;done; all green\x07");
+        assert_eq!(g.alert.take(), Some(("Build".into(), "done; all green".into())));
+        feed(&mut g, "\x1b]2;vim\x07\x1b]9;tests passed\x07");
+        assert_eq!(g.alert.take(), Some(("vim".into(), "tests passed".into())));
+        // ConEmu progress reports are not messages.
+        feed(&mut g, "\x1b]9;4;1;50\x07");
+        assert_eq!(g.alert, None);
     }
 
     #[test]

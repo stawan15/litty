@@ -1,6 +1,6 @@
 use unicode_width::UnicodeWidthChar;
 use crate::font::{Fonts, Glyph};
-use crate::grid::{BOLD, Cell, CursorShape, Grid, ITALIC, Mark, UNDERLINE, ansi, def_bg};
+use crate::grid::{BOLD, Cell, CursorShape, Grid, ITALIC, Mark, UL_SHIFT, UL_STYLE, UNDERLINE, ansi, def_bg};
 use crate::theme::theme;
 
 
@@ -331,8 +331,7 @@ impl Renderer {
                 }
             }
             if c.attrs & UNDERLINE != 0 {
-                let uy = (self.fonts.ascent as usize + 2).min(ch - thick);
-                self.fill(ox + x * cw, oy + uy, cw, thick, fg);
+                self.underline(c, ox + x * cw, oy, thick, fg);
             }
         }
         if cursor_row {
@@ -497,6 +496,40 @@ impl Renderer {
         self.fill(bx, by, bw, bh, theme().tab_text);
         self.fill(bx + u, by + u, bw - 2 * u, bh - 2 * u, theme().panel_bg);
         self.text(&label, bx + 4 * u, by + 2 * u, theme().fg);
+    }
+
+    /// The underline of one cell at (x, y), in its SGR 4:n style and SGR 58 colour.
+    fn underline(&mut self, c: &Cell, x: usize, y: usize, thick: usize, fg: u32) {
+        let (cw, ch) = (self.fonts.cell_w, self.fonts.cell_h);
+        let color = c.underline_color(fg);
+        let uy = (self.fonts.ascent as usize + 2).min(ch - thick);
+        match (c.attrs & UL_STYLE) >> UL_SHIFT {
+            // Double: two lines with a line's gap between them.
+            1 => {
+                let uy = uy.min(ch.saturating_sub(3 * thick));
+                self.fill(x, y + uy, cw, thick, color);
+                self.fill(x, y + uy + 2 * thick, cw, thick, color);
+            }
+            // Curly: one period of a wave per cell, so neighbouring cells join.
+            2 => {
+                let amp = (2 * thick).max(2);
+                let uy = uy.min(ch.saturating_sub(thick + amp));
+                for i in 0..cw {
+                    let phase = std::f32::consts::TAU * (i as f32 + 0.5) / cw as f32;
+                    let dy = ((1.0 - phase.cos()) / 2.0 * amp as f32).round() as usize;
+                    self.fill(x + i, y + uy + dy, 1, thick, color);
+                }
+            }
+            // Dotted: square dots, spaced by the screen column so they line up across cells.
+            3 => {
+                for i in (0..cw).filter(|i| (x + i) / thick % 2 == 0) {
+                    self.fill(x + i, y + uy, 1, thick, color);
+                }
+            }
+            // Dashed: one dash per cell with a gap at each edge.
+            4 => self.fill(x + cw / 6, y + uy, cw - cw / 3, thick, color),
+            _ => self.fill(x, y + uy, cw, thick, color),
+        }
     }
 
     /// Draw a single line of text at pixel (x, y) using the monospace grid.
