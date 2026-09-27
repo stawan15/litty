@@ -63,6 +63,8 @@ pub enum TrayAction {
     Quit,
     /// A "command finished" notification was clicked: show the pane with this id.
     Focus(usize),
+    /// The quick-terminal hotkey was pressed.
+    Quick,
 }
 
 /// Menu items carry their action as a tag: the index in this list.
@@ -70,6 +72,85 @@ const ACTIONS: [TrayAction; 4] = [TrayAction::Check, TrayAction::Install, TrayAc
 
 type Sink = Box<dyn Fn(TrayAction) + Send + Sync>;
 static SINK: OnceLock<Sink> = OnceLock::new();
+
+/// Carbon virtual key code for a key name as written in the config ("a", "`", "space", "f5").
+pub fn key_code(name: &str) -> Option<u32> {
+    const KEYS: &str = "asdfhgzxcv?bqweryt123465=97-80]ou[ip?lj'k;\\,/nm.";
+    let code = match name {
+        "`" | "grave" => 0x32,
+        "space" => 0x31,
+        "return" | "enter" => 0x24,
+        "tab" => 0x30,
+        "escape" => 0x35,
+        f if f.starts_with('f') && f.len() > 1 => {
+            const F: [u32; 12] = [0x7A, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64, 0x65, 0x6D, 0x67, 0x6F];
+            *F.get(f[1..].parse::<usize>().ok()?.checked_sub(1)?)?
+        }
+        k if k.chars().count() == 1 => KEYS.find(k).filter(|_| k != "?")? as u32,
+        _ => return None,
+    };
+    Some(code)
+}
+
+/// A system-wide hotkey (Carbon's RegisterEventHotKey: no Accessibility permission needed) that
+/// sends `TrayAction::Quick`. `mods` are the config's SHIFT/ALT/CTRL/SUPER bits. Carbon is loaded
+/// only here, when the config asks for a quick terminal.
+pub fn register_hotkey(key: u32, mods: u8) -> bool {
+    use crate::kitty::{ALT, CTRL, SHIFT, SUPER};
+    use nix::libc::{RTLD_LAZY, dlopen, dlsym};
+    type Target = *mut c_void;
+    type Handler = extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32;
+    #[repr(C)]
+    struct Spec {
+        class: u32,
+        kind: u32,
+    }
+    #[repr(C)]
+    struct HotKeyId {
+        signature: u32,
+        id: u32,
+    }
+    extern "C" fn pressed(_: *mut c_void, _: *mut c_void, _: *mut c_void) -> i32 {
+        if let Some(sink) = SINK.get() {
+            sink(TrayAction::Quick);
+        }
+        0
+    }
+    let carbon_mods = [(SUPER, 0x100), (SHIFT, 0x200), (ALT, 0x800), (CTRL, 0x1000)].iter().filter(|(m, _)| mods & m != 0).map(|(_, c)| c).sum();
+    // SAFETY: Carbon's documented C API, called once on the main thread with matching signatures.
+    unsafe {
+        let lib = dlopen(c"/System/Library/Frameworks/Carbon.framework/Carbon".as_ptr(), RTLD_LAZY);
+        let (target, install, register) = (
+            dlsym(lib, c"GetApplicationEventTarget".as_ptr()),
+            dlsym(lib, c"InstallEventHandler".as_ptr()),
+            dlsym(lib, c"RegisterEventHotKey".as_ptr()),
+        );
+        if lib.is_null() || target.is_null() || install.is_null() || register.is_null() {
+            return false;
+        }
+        let target: extern "C" fn() -> Target = std::mem::transmute(target);
+        let install: extern "C" fn(Target, Handler, u32, *const Spec, *mut c_void, *mut *mut c_void) -> i32 = std::mem::transmute(install);
+        let register: extern "C" fn(u32, u32, HotKeyId, Target, u32, *mut *mut c_void) -> i32 = std::mem::transmute(register);
+        let app = target();
+        let spec = Spec { class: u32::from_be_bytes(*b"keyb"), kind: 5 }; // kEventHotKeyPressed
+        let (mut handler, mut hotkey) = (std::ptr::null_mut(), std::ptr::null_mut());
+        install(app, pressed, 1, &spec, std::ptr::null_mut(), &mut handler) == 0
+            && register(key, carbon_mods, HotKeyId { signature: u32::from_be_bytes(*b"lity"), id: 1 }, app, 0, &mut hotkey) == 0
+    }
+}
+
+/// Bring litty to the front, or hide it so the previous app gets the keyboard back.
+pub fn activate(front: bool) {
+    // SAFETY: NSApplication messages on the main thread.
+    unsafe {
+        let app: Retained<AnyObject> = msg_send![class!(NSApplication), sharedApplication];
+        if front {
+            let _: () = msg_send![&*app, activateIgnoringOtherApps: true];
+        } else {
+            let _: () = msg_send![&*app, hide: std::ptr::null::<AnyObject>()];
+        }
+    }
+}
 
 /// Where menu picks and notification clicks go (the app's event loop). Set once at startup.
 pub fn set_sink(sink: Sink) {
@@ -332,5 +413,15 @@ impl Notifier {
         unsafe {
             let _: () = msg_send![&*self.center, requestAuthorizationWithOptions: 4usize, completionHandler: &*post];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hotkey_key_codes_match_apple_kvk() {
+        let k = |n| super::key_code(n);
+        assert_eq!([k("a"), k("0"), k("]"), k("p"), k("l"), k("\\"), k("."), k("`"), k("space"), k("f1"), k("f12")], [0x00, 0x1D, 0x1E, 0x23, 0x25, 0x2A, 0x2F, 0x32, 0x31, 0x7A, 0x6F].map(Some));
+        assert_eq!((k("?"), k("f13"), k("nope")), (None, None, None));
     }
 }

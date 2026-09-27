@@ -2154,6 +2154,9 @@ struct App {
     alert_after: Instant,
     /// Quit was chosen (the session is saved): closing the windows must not clear it.
     quitting: bool,
+    /// The quick terminal's window (macOS hotkey), if it was opened.
+    #[cfg(target_os = "macos")]
+    quick: Option<WindowId>,
     #[cfg(target_os = "macos")]
     tray: Option<macos::Tray>,
     /// The tray is wanted but not made yet; it is made shortly after the first frame, because
@@ -2316,6 +2319,39 @@ impl App {
         next.into_iter().chain(running.filter(|&t| t > now)).chain(done.map(|d| d.1)).min()
     }
 
+    /// The quick terminal: a window across the top of the screen, shown and hidden by a hotkey.
+    #[cfg(target_os = "macos")]
+    fn toggle_quick(&mut self, el: &ActiveEventLoop) {
+        if let Some(w) = self.quick.and_then(|id| self.wins.get(&id)).and_then(|w| w.window.clone()) {
+            let shown = w.is_visible().unwrap_or(true);
+            if shown && w.has_focus() {
+                w.set_visible(false);
+                // With no other litty window in front, give the keyboard back to the previous app.
+                if !self.wins.values().any(|x| x.focused && x.window.as_ref().is_some_and(|x| x.id() != w.id())) {
+                    macos::activate(false);
+                }
+            } else {
+                w.set_visible(true);
+                macos::activate(true);
+                w.focus_window();
+            }
+            return;
+        }
+        self.add_window(el, &[], None, None);
+        let Some(id) = self.last_focus else { return };
+        self.quick = Some(id);
+        let Some(w) = self.wins.get(&id).and_then(|w| w.window.clone()) else { return };
+        if let Some(m) = w.current_monitor() {
+            let (pos, size) = (m.position(), m.size());
+            w.set_decorations(false);
+            w.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+            w.set_outer_position(pos);
+            let _ = w.request_inner_size(PhysicalSize::new(size.width, size.height * 2 / 5));
+        }
+        macos::activate(true);
+        w.focus_window();
+    }
+
     /// Save the session, then close every window (the app exits when the last one goes).
     fn quit(&mut self) {
         self.save_session();
@@ -2334,6 +2370,7 @@ impl App {
         let mut wins: Vec<((usize, usize), &Win)> = self
             .wins
             .values()
+            .filter(|w| !self.is_quick(w))
             .map(|w| {
                 #[cfg(target_os = "macos")]
                 let place = w.window.as_deref().map_or((0, 0), macos::tab_position);
@@ -2392,9 +2429,20 @@ impl App {
     fn close_window(&mut self, id: WindowId) {
         if let Some(mut w) = self.wins.remove(&id) {
             w.shutdown();
-            if self.wins.is_empty() {
+            if self.wins.is_empty() && !self.is_quick(&w) {
                 w.save_state();
             }
+        }
+    }
+
+    /// Whether `w` is the quick terminal (its size and place are not the user's normal window).
+    fn is_quick(&self, w: &Win) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.quick.is_some() && w.window.as_ref().map(|x| x.id()) == self.quick;
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = w;
+            false
         }
     }
 }
@@ -2420,6 +2468,11 @@ impl ApplicationHandler<Ev> for App {
             self.tray_wanted = config::get().tray;
             let proxy = Mutex::new(self.proxy.clone());
             macos::set_sink(Box::new(move |a| drop(proxy.lock().unwrap().send_event(Ev::Tray(a)))));
+            if let Some((mods, key)) = &config::get().quick_terminal {
+                if !macos::key_code(key).is_some_and(|code| macos::register_hotkey(code, *mods)) {
+                    eprintln!("litty: can't use quick-terminal = {key} (key or combination unavailable)");
+                }
+            }
         }
     }
 
@@ -2504,6 +2557,7 @@ impl ApplicationHandler<Ev> for App {
                         }
                     }
                     macos::TrayAction::Quit => self.quit(),
+                    macos::TrayAction::Quick => self.toggle_quick(el),
                 }
                 self.settle(el, None);
             }
@@ -2511,7 +2565,7 @@ impl ApplicationHandler<Ev> for App {
     }
 
     fn exiting(&mut self, _: &ActiveEventLoop) {
-        let last = self.last_focus.and_then(|id| self.wins.get(&id)).or_else(|| self.wins.values().next());
+        let last = self.last_focus.and_then(|id| self.wins.get(&id)).filter(|w| !self.is_quick(w)).or_else(|| self.wins.values().find(|w| !self.is_quick(w)));
         if let Some(w) = last {
             w.save_state();
         }
@@ -2580,6 +2634,8 @@ fn main() {
         last_focus: None,
         alert_after: Instant::now(),
         quitting: false,
+        #[cfg(target_os = "macos")]
+        quick: None,
         #[cfg(target_os = "macos")]
         tray: None,
         #[cfg(target_os = "macos")]

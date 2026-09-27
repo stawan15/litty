@@ -13,6 +13,7 @@
 //!   keybind = ctrl+shift+t = new-tab   (`= none` passes the keys to the program instead)
 //!   term = xterm-litty             (TERM for programs; default xterm-256color)
 //!   restore = true | false         (reopen the tabs, splits and folders open at Quit)
+//!   quick-terminal = ctrl+`        (macOS: a system-wide key that drops a terminal from the top)
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -36,6 +37,8 @@ pub struct Config {
     pub keybinds: Vec<Keybind>,
     pub term: Option<String>,
     pub restore: bool,
+    /// Modifier bits and key name of the quick-terminal hotkey.
+    pub quick_terminal: Option<(u8, String)>,
 }
 
 pub const FOREGROUND: usize = 16;
@@ -72,6 +75,7 @@ const DEFAULT: Config = Config {
     keybinds: Vec::new(),
     term: None,
     restore: true,
+    quick_terminal: None,
 };
 
 /// "#rrggbb" or "rrggbb".
@@ -167,6 +171,7 @@ pub fn parse(text: &str) -> Config {
             }
             "keybind" => c.keybinds.extend(keybind(value)),
             "restore" => c.restore = value != "false",
+            "quick-terminal" => c.quick_terminal = keybind(&format!("{value} = none")).map(|k| (k.mods, k.key)),
             "term" if !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c)) => c.term = Some(value.to_string()),
             _ => {}
         }
