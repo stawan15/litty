@@ -217,28 +217,31 @@ fn base64(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A PNG as straight RGBA: (width, height, pixels).
+pub fn decode_png(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), &'static str> {
+    let mut dec = png::Decoder::new(bytes);
+    dec.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);
+    let mut reader = dec.read_info().map_err(|_| "EBADPNG:not a PNG")?;
+    let (w, h) = (reader.info().width as usize, reader.info().height as usize);
+    if w > MAX_SIDE || h > MAX_SIDE {
+        return Err("EFBIG:image too large");
+    }
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).map_err(|_| "EBADPNG:bad PNG data")?;
+    buf.truncate(info.buffer_size());
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::GrayscaleAlpha => buf.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+        _ => return Err("EBADPNG:unsupported PNG colour type"),
+    };
+    Ok((w, h, rgba))
+}
+
 /// Pixels as straight RGBA from the transmitted bytes.
 fn decode(k: &Keys, bytes: Vec<u8>) -> Result<(usize, usize, Vec<u8>), &'static str> {
     let bytes = if k.compressed { miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes, MAX_PAYLOAD).map_err(|_| "EINVAL:bad zlib data")? } else { bytes };
     let (w, h, rgba) = match k.format {
-        100 => {
-            let mut dec = png::Decoder::new(&bytes[..]);
-            dec.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);
-            let mut reader = dec.read_info().map_err(|_| "EBADPNG:not a PNG")?;
-            let (w, h) = (reader.info().width as usize, reader.info().height as usize);
-            if w > MAX_SIDE || h > MAX_SIDE {
-                return Err("EFBIG:image too large");
-            }
-            let mut buf = vec![0; reader.output_buffer_size()];
-            let info = reader.next_frame(&mut buf).map_err(|_| "EBADPNG:bad PNG data")?;
-            buf.truncate(info.buffer_size());
-            let rgba = match info.color_type {
-                png::ColorType::Rgba => buf,
-                png::ColorType::GrayscaleAlpha => buf.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
-                _ => return Err("EBADPNG:unsupported PNG colour type"),
-            };
-            (w, h, rgba)
-        }
+        100 => decode_png(&bytes)?,
         24 | 32 => {
             let (w, h) = (k.src_w, k.src_h);
             let bpp = k.format as usize / 8;

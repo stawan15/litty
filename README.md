@@ -29,6 +29,7 @@ A small, fast terminal for macOS and Linux. Zero config: no settings file.
 
     cargo run --release            # login shell
     cargo run --release -- -e cmd  # run a command instead
+    litty img photo.jpg            # show pictures in the terminal you're in
 
 ## Configuration (optional)
 
@@ -67,8 +68,10 @@ mouse reporting (SGR), bracketed paste, focus events (1004), synchronized output
 OSC 7/8/52/133, notifications (OSC 9, OSC 777), colour queries (OSC 4/10/11/12), DECRQM, DSR,
 XTWINOPS size reports, alternate screen, scrollback with reflow.
 
-- **Images:** the Kitty graphics protocol (PNG, RGB, RGBA; inline, file or temporary file),
-  as used by `kitten icat`, chafa, timg, yazi and image.nvim. Images scroll with their text and
+- **Images:** `litty img photo.jpg` shows PNG and JPEG pictures right in the terminal, no other
+  tools needed (fitted to the window, turned upright by EXIF, works over ssh when the remote end
+  has litty). Underneath is the Kitty graphics protocol (PNG, RGB, RGBA; inline, file or
+  temporary file), so `kitten icat`, chafa, timg, yazi and image.nvim work too. Images scroll with their text and
   each pane keeps at most 64 MB of them. Not yet: sixel, shared memory, Unicode placeholders.
 - **Kitty keyboard protocol** (all five enhancement flags), so neovim, helix and fish can tell
   Ctrl+I from Tab, see key releases and so on.

@@ -4,6 +4,7 @@ mod emoji;
 mod font;
 mod graphics;
 mod grid;
+mod img;
 mod kitty;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -2621,6 +2622,10 @@ impl ApplicationHandler<Ev> for App {
 }
 
 fn main() {
+    // `litty img FILE...` prints pictures in the current terminal and exits (no window).
+    if std::env::args().nth(1).as_deref() == Some("img") {
+        std::process::exit(img::main(&std::env::args().skip(2).collect::<Vec<_>>()));
+    }
     theme::init(config::get().light, &config::get().colors);
     // Launched from Finder or the Dock the working directory is "/": start in the home directory.
     if std::env::current_dir().is_ok_and(|d| d == std::path::Path::new("/")) {
