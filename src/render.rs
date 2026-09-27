@@ -339,6 +339,7 @@ impl Renderer {
             } else {
                 (fg, bg)
             };
+            let (fg, bg) = if g.reverse_screen { (bg, fg) } else { (fg, bg) };
             // Unfocused panes are dimmed.
             if focused { (fg, bg) } else { (mix_color(fg, bg, 90), bg) }
         };
