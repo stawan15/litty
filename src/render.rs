@@ -185,6 +185,8 @@ pub struct Renderer {
     tmp: Vec<Cell>,
     /// Rows (first, last + 1) whose pixels changed since the last `take_damage`.
     damage: Option<(usize, usize)>,
+    /// The window is hidden and its framebuffer freed (see `release`).
+    released: bool,
     /// Glyphs are only drawn inside this (x0, y0, x1, y1): one that overhangs its cell would leave
     /// pixels behind that no later repaint of the row erases.
     clip: [usize; 4],
@@ -201,6 +203,7 @@ impl Renderer {
             bar_h: 0,
             tmp: Vec::new(),
             damage: None,
+            released: false,
             clip: [0; 4],
         }
     }
@@ -213,9 +216,23 @@ impl Renderer {
     pub fn resize(&mut self, w: usize, h: usize) {
         self.w = w;
         self.h = h;
+        if self.released {
+            return;
+        }
         self.fb = vec![def_bg(); w * h];
         self.damage = Some((0, h));
         self.clip = [0, 0, w, h];
+    }
+
+    /// The window is hidden: free the framebuffer (a Retina window's is tens of MB). Nothing may
+    /// be drawn until `restore`, which starts over with a blank one.
+    pub fn release(&mut self) {
+        (self.released, self.fb) = (true, Vec::new());
+    }
+
+    pub fn restore(&mut self) {
+        self.released = false;
+        self.resize(self.w, self.h);
     }
 
     /// The area panes are laid out in: the window minus padding and the tab bar.
