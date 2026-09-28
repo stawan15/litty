@@ -362,6 +362,10 @@ struct Win {
     find: Option<String>,
     /// A short message in the corner ("saved ~/Desktop/…cast") and when it goes away.
     flash: Option<(String, Instant)>,
+    /// Hidden (a background native tab, minimised, covered): pixel buffers are freed meanwhile.
+    occluded: bool,
+    /// When to let macOS reclaim the spare surfaces of a window that stopped drawing.
+    trim_at: Option<Instant>,
     /// Several lines waiting for Enter before they are pasted into a shell: (bytes, lines).
     pending_paste: Option<(Vec<u8>, usize)>,
     /// The link under the mouse when the right-click menu opened.
@@ -388,6 +392,8 @@ const PAD_PT: f32 = 10.0;
 /// Minimum time between frames. Drawing holds the grid lock, so capping it keeps the parser
 /// thread fed during floods like `cat bigfile`.
 const FRAME: Duration = Duration::from_millis(15);
+/// A window that stopped drawing for this long gives its spare surfaces back (macOS).
+const TRIM_AFTER: Duration = Duration::from_millis(250);
 const BLINK: Duration = Duration::from_millis(530);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Longest a synchronized update (mode 2026) may hold the screen back if the program never ends it.
@@ -947,7 +953,11 @@ impl Win {
     /// Rebuild fonts for the current point size / display scale, then re-layout.
     fn rebuild(&mut self) {
         let pad = config::get().padding.unwrap_or(PAD_PT);
-        self.renderer = Some(Renderer::new(self.font_pt * self.scale, (pad * self.scale) as usize));
+        let mut renderer = Renderer::new(self.font_pt * self.scale, (pad * self.scale) as usize);
+        if self.occluded {
+            renderer.release();
+        }
+        self.renderer = Some(renderer);
         if let (Some(size), Some(r), Some(p)) = (self.window.as_ref().map(|w| w.inner_size()), &mut self.renderer, &mut self.presenter) {
             p.resize(size.width as usize, size.height as usize);
             r.resize(size.width as usize, size.height as usize);
@@ -956,6 +966,26 @@ impl Win {
     }
 
     fn redraw(&mut self) {
+        if self.occluded {
+            // Nothing to paint, but the (native) tab title and OSC 52 copies still apply.
+            let (mut title, mut clip) = (None, None);
+            let tab = &self.tabs[self.active];
+            for pane in &tab.panes {
+                pane.pending.store(false, Ordering::SeqCst);
+                let mut t = pane.term.lock().unwrap();
+                clip = clip.or(t.grid.clip.take());
+                if pane.id == tab.active {
+                    title = t.grid.title.take();
+                }
+            }
+            if let (Some(title), Some(w)) = (title, &self.window) {
+                w.set_title(&title);
+            }
+            if let Some(clip) = clip {
+                clipboard_set(&clip);
+            }
+            return;
+        }
         // Titles for the tab bar, taken before locking any pane (never hold two locks).
         let titles: Vec<String> = if self.tabs.len() > 1 {
             self.tabs
@@ -1006,6 +1036,9 @@ impl Win {
         }
         let damage = r.take_damage();
         presenter.present(&r.fb, damage);
+        if cfg!(target_os = "macos") {
+            self.trim_at = Some(Instant::now() + TRIM_AFTER);
+        }
         if let Some(title) = title {
             win.set_title(&title);
         }
@@ -2288,6 +2321,8 @@ impl Win {
             flash: None,
             pending_paste: None,
             link: None,
+            occluded: false,
+            trim_at: None,
             #[cfg(not(target_os = "macos"))]
             menu: None,
         };
@@ -2314,7 +2349,12 @@ impl Win {
 
     /// Blink the cursor, and return when this window next needs waking (a postponed frame or a blink).
     fn tick(&mut self, now: Instant) -> Option<Instant> {
-        let mut deadline = self.frame_deadline;
+        if let (Some(at), Some(p)) = (self.trim_at, &mut self.presenter)
+            && now >= at
+        {
+            self.trim_at = p.trim().then_some(now + TRIM_AFTER);
+        }
+        let mut deadline = self.frame_deadline.into_iter().chain(self.trim_at).min();
         if let Some((_, until)) = self.flash {
             if now >= until {
                 self.flash = None;
@@ -2354,6 +2394,22 @@ impl Win {
                     // Paced from the start of the frame, so drawing time doesn't stretch the interval.
                     self.next_frame = Instant::now() + FRAME;
                     self.redraw();
+                }
+            }
+            WindowEvent::Occluded(hidden) if hidden != self.occluded => {
+                self.occluded = hidden;
+                if let (Some(p), Some(r)) = (&mut self.presenter, &mut self.renderer) {
+                    if hidden {
+                        p.release();
+                        r.release();
+                        self.trim_at = None;
+                    } else {
+                        r.restore();
+                        for pane in self.tabs.iter().flat_map(|t| &t.panes) {
+                            pane.term.lock().unwrap().grid.dirty.fill(true);
+                        }
+                        self.redraw_soon();
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
