@@ -31,6 +31,13 @@ mod other {
             }
         }
 
+        /// Nothing to free: softbuffer keeps one buffer.
+        pub fn release(&mut self) {}
+
+        pub fn trim(&mut self) -> bool {
+            false
+        }
+
         pub fn present(&mut self, fb: &[u32], damage: Option<(usize, usize)>) {
             if damage.is_none() {
                 return;
@@ -52,7 +59,7 @@ mod mac {
     use objc2::runtime::{AnyObject, Bool};
     use objc2_core_foundation::{CFDictionary, CFRetained, CGPoint, CGRect, CGSize};
     use objc2_foundation::{NSDictionary, NSNumber, NSString, ns_string};
-    use objc2_io_surface::{IOSurfaceLockOptions, IOSurfaceRef};
+    use objc2_io_surface::{IOSurfaceLockOptions, IOSurfacePurgeabilityState, IOSurfaceRef};
     use objc2_quartz_core::{CALayer, CATransaction, kCAGravityTopLeft};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -67,6 +74,9 @@ mod mac {
         surfaces: Vec<CFRetained<IOSurfaceRef>>,
         /// Per surface: rows that changed since it was last written.
         stale: Vec<Option<(usize, usize)>>,
+        /// Per surface: marked purgeable while not needed, so macOS may take its memory back
+        /// (and doesn't count it against litty).
+        volatile: Vec<bool>,
         shown: usize,
         size: (usize, usize),
         /// False while the background is see-through (config `background-opacity`).
@@ -86,16 +96,45 @@ mod mac {
             layer.setOpaque(true);
             layer.setContentsGravity(unsafe { kCAGravityTopLeft });
             root.addSublayer(&layer);
-            Presenter { window: window.clone(), layer, surfaces: Vec::new(), stale: Vec::new(), shown: 0, size: (0, 0), opaque: true }
+            Presenter { window: window.clone(), layer, surfaces: Vec::new(), stale: Vec::new(), volatile: Vec::new(), shown: 0, size: (0, 0), opaque: true }
         }
 
         pub fn resize(&mut self, w: usize, h: usize) {
             self.size = (w, h);
             self.surfaces.clear();
             self.stale.clear();
+            self.volatile.clear();
             let scale = self.window.scale_factor();
             self.layer.setContentsScale(scale);
             self.layer.setBounds(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(w as f64 / scale, h as f64 / scale)));
+        }
+
+        /// The window is hidden: drop every surface (the next frame makes new ones).
+        pub fn release(&mut self) {
+            self.surfaces.clear();
+            self.stale.clear();
+            self.volatile.clear();
+            // SAFETY: no contents is a valid value.
+            unsafe { self.layer.setContents(None) };
+        }
+
+        /// Mark surfaces that aren't shown and that the compositor let go of as purgeable. Returns
+        /// true while one is still in use, so the caller looks again shortly.
+        pub fn trim(&mut self) -> bool {
+            let mut busy = false;
+            for (i, s) in self.surfaces.iter().enumerate() {
+                if i == self.shown || self.volatile[i] {
+                    continue;
+                }
+                if s.is_in_use() {
+                    busy = true;
+                } else {
+                    // SAFETY: a valid surface; the old state isn't needed.
+                    unsafe { s.set_purgeable(IOSurfacePurgeabilityState::PurgeableVolatile.0, std::ptr::null_mut()) };
+                    self.volatile[i] = true;
+                }
+            }
+            busy
         }
 
         fn new_surface(&self) -> Option<CFRetained<IOSurfaceRef>> {
@@ -126,11 +165,21 @@ mod mac {
                     let Some(s) = self.new_surface() else { return };
                     self.surfaces.push(s);
                     self.stale.push(Some((0, self.size.1)));
+                    self.volatile.push(false);
                     n
                 }
                 None => (self.shown + 1) % n,
             };
             let s = &self.surfaces[i];
+            if std::mem::take(&mut self.volatile[i]) {
+                let mut old = 0;
+                // SAFETY: a valid surface and a place for its previous state.
+                unsafe { s.set_purgeable(IOSurfacePurgeabilityState::PurgeableNonVolatile.0, &mut old) };
+                if old == IOSurfacePurgeabilityState::PurgeableEmpty.0 {
+                    // macOS took the pixels back: write the whole frame.
+                    self.stale[i] = Some((0, self.size.1));
+                }
+            }
             let (w, stride) = (self.size.0, s.bytes_per_row() / 4);
             let (r0, r1) = self.stale[i].take().unwrap_or((0, 0));
             // Below full opacity the background colour becomes see-through (premultiplied alpha).

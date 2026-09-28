@@ -120,6 +120,10 @@ fn keybind(v: &str) -> Option<Keybind> {
 }
 
 fn path() -> Option<PathBuf> {
+    // Tests use the defaults, whatever the person running them has configured.
+    if cfg!(test) {
+        return None;
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     Some(base.join("litty/config"))
 }
