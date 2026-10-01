@@ -6,6 +6,10 @@
   </picture>
 </p>
 
+<p align="center">
+  <img src="assets/demo.gif" alt="litty demo" width="720">
+</p>
+
 ## Install
 
 | Platform | Command |
