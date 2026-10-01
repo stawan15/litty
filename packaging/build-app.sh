@@ -25,7 +25,10 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns dist/icon.iconset -o dist/litty.app/Contents/Resources/AppIcon.icns
 tic -x -o dist/litty.app/Contents/Resources/terminfo packaging/litty.terminfo
-sign dist/litty.app
+# Ad hoc, pin the designated requirement to the bundle id so macOS privacy grants (Screen
+# Recording, Files, ...) survive rebuilds; the default requirement is the binary's hash.
+if [ -n "$SIGN_ID" ]; then sign dist/litty.app
+else sign -r='designated => identifier "dev.litty.app"' dist/litty.app; fi
 mkdir dist/dmg && cp -R dist/litty.app dist/dmg/ && ln -s /Applications dist/dmg/Applications
 DMG="dist/litty-$VERSION-macos-universal.dmg"
 hdiutil create -quiet -volname "litty" -srcfolder dist/dmg -ov -format UDZO "$DMG"
