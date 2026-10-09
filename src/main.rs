@@ -353,6 +353,7 @@ struct Win {
     frame_deadline: Option<Instant>,
     blink_on: bool,
     next_blink: Instant,
+    next_autoscroll: Instant,
     focused: bool,
     rail_drag: bool,
     /// Divider being dragged (index into the active tab's dividers).
@@ -395,6 +396,8 @@ const FRAME: Duration = Duration::from_millis(15);
 /// A window that stopped drawing for this long gives its spare surfaces back (macOS).
 const TRIM_AFTER: Duration = Duration::from_millis(250);
 const BLINK: Duration = Duration::from_millis(530);
+/// Rows scroll this often while a selection is dragged past the top or bottom of the pane.
+const AUTOSCROLL: Duration = Duration::from_millis(40);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Longest a synchronized update (mode 2026) may hold the screen back if the program never ends it.
 const SYNC_MAX: Duration = Duration::from_millis(150);
@@ -2189,7 +2192,7 @@ impl Win {
             return self.set_icon(if self.tab().dividers[i].vertical { CursorIcon::ColResize } else { CursorIcon::RowResize });
         }
         let term = self.term().clone();
-        let mut t = term.lock().unwrap();
+        let t = term.lock().unwrap();
         let rect = self.active_rect();
         let (col, row) = self.cell_at(&t.grid, rect);
         // Pointer cursor over links (with the modifier held) and over the rail.
@@ -2197,14 +2200,8 @@ impl Win {
         let over_link = self.link_modifier() && t.grid.url_at(row, col).is_some();
         self.set_icon(if in_rail || over_link { CursorIcon::Pointer } else { CursorIcon::Default });
         if self.selecting {
-            let head = (t.grid.abs_row(row), col);
-            let sel = Some((self.anchor, head));
-            if t.grid.sel != sel && (head != self.anchor || t.grid.sel.is_some()) {
-                t.grid.sel = sel;
-                t.grid.dirty.fill(true);
-                drop(t);
-                self.redraw_soon();
-            }
+            drop(t);
+            self.extend_selection();
             return;
         }
         if t.grid.mouse >= 2 && (col, row) != self.last_cell {
@@ -2219,6 +2216,21 @@ impl Win {
                 drop(t);
                 self.send(&report);
             }
+        }
+    }
+
+    /// Move the selection head to the cell under the mouse (clamped to the pane).
+    fn extend_selection(&mut self) {
+        let term = self.term().clone();
+        let mut t = term.lock().unwrap();
+        let (col, row) = self.cell_at(&t.grid, self.active_rect());
+        let head = (t.grid.abs_row(row), col);
+        let sel = Some((self.anchor, head));
+        if t.grid.sel != sel && (head != self.anchor || t.grid.sel.is_some()) {
+            t.grid.sel = sel;
+            t.grid.dirty.fill(true);
+            drop(t);
+            self.redraw_soon();
         }
     }
 
@@ -2313,6 +2325,7 @@ impl Win {
             frame_deadline: None,
             blink_on: true,
             next_blink: Instant::now(),
+            next_autoscroll: Instant::now(),
             focused: true,
             rail_drag: false,
             divider_drag: None,
@@ -2361,6 +2374,25 @@ impl Win {
                 self.notice_changed();
             } else {
                 deadline = Some(deadline.map_or(until, |d| d.min(until)));
+            }
+        }
+        if self.selecting && !self.tabs.is_empty() {
+            let rect = self.active_rect();
+            let dir = if self.cursor.1 < rect.y as f64 {
+                1
+            } else if self.cursor.1 >= (rect.y + rect.h) as f64 {
+                -1
+            } else {
+                0
+            };
+            if dir != 0 {
+                if now >= self.next_autoscroll {
+                    self.next_autoscroll = now + AUTOSCROLL;
+                    self.term().lock().unwrap().grid.scroll_view(dir);
+                    self.extend_selection();
+                    self.redraw_soon();
+                }
+                deadline = Some(deadline.map_or(self.next_autoscroll, |d| d.min(self.next_autoscroll)));
             }
         }
         let blinking = self.focused && !self.tabs.is_empty() && self.term().lock().unwrap().grid.cursor_blink;

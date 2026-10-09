@@ -644,18 +644,22 @@ impl Grid {
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
         let mut out = String::new();
         let mut buf = Vec::new();
+        let mut joined = false;
         for id in a.0..=b.0 {
             let Some(line) = self.abs_line(id, &mut buf) else { continue };
+            let wraps = line.last().is_some_and(|c| c.attrs & WRAPPED != 0);
             let (start, end) = (if id == a.0 { a.1 } else { 0 }, if id == b.0 { b.1 + 1 } else { usize::MAX });
             let mut text = String::new();
             for c in line.iter().take(end).skip(start).filter(|c| c.ch != '\0') {
                 text.push(c.ch);
                 text.extend(c.comb.iter().filter(|&&m| m != '\0'));
             }
-            if id > a.0 {
+            if id > a.0 && !joined {
                 out.push('\n');
             }
-            out.push_str(text.trim_end_matches(' '));
+            // A soft-wrapped row continues on the next one: keep its spaces and join without a newline.
+            out.push_str(if wraps { &text } else { text.trim_end_matches(' ') });
+            joined = wraps;
         }
         Some(out)
     }
@@ -1780,6 +1784,15 @@ mod tests {
     }
 
     #[test]
+    fn selection_joins_soft_wrapped_rows() {
+        let mut g = Grid::new(6, 3);
+        feed(&mut g, "ab cdefgh\r\nz");
+        let base = g.pushed;
+        g.sel = Some(((base, 0), (base + 2, 5)));
+        assert_eq!(g.selection_text().unwrap(), "ab cdefgh\nz");
+    }
+
+    #[test]
     fn bold_italic_underline() {
         let mut g = Grid::new(6, 1);
         feed(&mut g, "\x1b[1ma\x1b[3;4mb\x1b[22;23;24mc\x1b[4:3md\x1b[4:0me");
@@ -2182,7 +2195,7 @@ mod tests {
         g.select_word(0, 3);
         assert_eq!(g.sel, Some(((0, 3), (0, 3))));
         g.select_line(1);
-        assert_eq!(g.selection_text().as_deref(), Some("foo bar-ba\nz quux"));
+        assert_eq!(g.selection_text().as_deref(), Some("foo bar-baz quux"));
     }
 
     #[test]
