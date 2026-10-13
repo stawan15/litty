@@ -648,8 +648,10 @@ fn clipboard_set(text: &[u8]) {
             if let Some(mut stdin) = c.stdin.take() {
                 let _ = stdin.write_all(text);
             }
-            let _ = c.wait();
-            return;
+            // wl-copy is installed on X11 desktops too but fails there: try the next tool.
+            if c.wait().is_ok_and(|s| s.success()) {
+                return;
+            }
         }
     }
 }

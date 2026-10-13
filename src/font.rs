@@ -125,6 +125,16 @@ const FAMILIES: &[Family] = &[
         index: [0; 4],
     },
     Family {
+        // openSUSE keeps fonts flat in /usr/share/fonts/truetype.
+        files: [
+            "/usr/share/fonts/truetype/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/DejaVuSansMono-Bold.ttf",
+            "/usr/share/fonts/truetype/DejaVuSansMono-Oblique.ttf",
+            "/usr/share/fonts/truetype/DejaVuSansMono-BoldOblique.ttf",
+        ],
+        index: [0; 4],
+    },
+    Family {
         files: [
             "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
             "/usr/share/fonts/liberation/LiberationMono-Bold.ttf",
